@@ -1,0 +1,12 @@
+# eval run outputs / probe results -- reproducible artifacts, not source
+eval/results/
+results_thinking_probe/
+log_*.txt
+
+# python
+__pycache__/
+*.pyc
+
+# local key files, if anyone drops one here by habit
+*.env
+.env
