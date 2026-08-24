@@ -1,6 +1,10 @@
-"""Call the fusion API and a baseline API once per task (no tools, single round each),
-write a replay JSONL. Both calls go through the same generic call_api() -- the eval code
-never touches fusion internals directly.
+"""Call the fusion API and a baseline API once per GPQA task (no tools, single
+round each, thinking on for both), write a replay JSONL. Both calls go through
+the same generic call_api() -- the eval code never touches fusion internals
+directly. The judge inside the fusion pipeline is asked NOT to think
+(reasoning_effort=none, handled inside mock_fusion_api); this script only
+controls the two things it actually calls: the fusion endpoint and the
+baseline endpoint, both with thinking on.
 Run: python3 -m eval.run_eval [--limit N]
 """
 import argparse
@@ -8,7 +12,7 @@ import json
 import os
 import time
 
-from .alpacaeval_tasks import load_tasks
+from .gpqa_tasks import load_tasks
 from .client import call_api
 
 
@@ -18,15 +22,25 @@ def run(fusion_url, fusion_model, baseline_url, baseline_model, out_path, limit=
         for task in tasks:
             messages = [{"role": "user", "content": task["instruction"]}]
             fusion_resp = call_api(fusion_url, fusion_model, messages, allow_tool_call_output=False)
-            baseline_resp = call_api(baseline_url, baseline_model, messages)
+            baseline_resp = call_api(baseline_url, baseline_model, messages, reasoning_effort="high")
             row = {
-                "schema": "0g.fusion_eval.alpacaeval.replay.v1",
+                "schema": "0g.fusion_eval.gpqa.replay.v1",
+                "question_id": task["question_id"],
                 "instruction": task["instruction"],
-                "fusion": {"model": fusion_model, "content": fusion_resp["choices"][0]["message"]["content"],
-                           "raw_response": fusion_resp},
-                "baseline": {"model": baseline_model, "content": baseline_resp["choices"][0]["message"]["content"],
-                             "raw_response": baseline_resp},
-                "config_id": f"alpacaeval-v1-{fusion_model}-vs-{baseline_model}",
+                "correct_letter": task["correct_letter"],
+                "fusion": {
+                    "model": fusion_model,
+                    "content": fusion_resp["choices"][0]["message"]["content"],
+                    "reasoning_content": fusion_resp["choices"][0]["message"].get("reasoning_content"),
+                    "raw_response": fusion_resp,
+                },
+                "baseline": {
+                    "model": baseline_model,
+                    "content": baseline_resp["choices"][0]["message"]["content"],
+                    "reasoning_content": baseline_resp["choices"][0]["message"].get("reasoning_content"),
+                    "raw_response": baseline_resp,
+                },
+                "config_id": f"gpqa-v1-{fusion_model}-vs-{baseline_model}",
             }
             f.write(json.dumps(row) + "\n")
     return out_path

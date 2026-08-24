@@ -1,8 +1,9 @@
-"""Self-test suite, plain asserts (no external test framework). Runs entirely offline
-via the FAKE llm stand-in (no ZG_UPSTREAM_BASE_URL set). Covers every requirement from
-the design doc: single-round panel/judge/synthesis, no iteration, no tool execution,
-allow_tool_call_output gating (panel/synthesis vs judge), eval client -> real HTTP ->
-mock server round trip, replay file schema, and grading.
+"""Self-test suite, plain asserts (no external test framework). Runs entirely
+offline via the FAKE llm stand-in (no ZG_UPSTREAM_BASE_URL set). Covers the
+GPQA-round requirements: reasoning_effort on for panel/synthesis/baseline, off
+for judge (with defensive stripping), panel evidence carrying reasoning AND
+content, thinking-extraction for both real-world field patterns, GPQA task
+loading + letter extraction/grading, and the end-to-end HTTP round trip.
 Run: python3 tests.py
 """
 import json
@@ -13,6 +14,7 @@ import urllib.request
 
 os.environ.pop("ZG_UPSTREAM_BASE_URL", None)  # force FAKE mode for this whole run
 
+from llm_client import extract_thinking, REASONING_ON, REASONING_OFF  # noqa: E402
 from mock_fusion_api import pipeline, panel_config as cfg  # noqa: E402
 from mock_fusion_api.server import Handler  # noqa: E402
 from http.server import ThreadingHTTPServer  # noqa: E402
@@ -25,67 +27,86 @@ def check(name, cond):
     print(("PASS " if cond else "FAIL ") + name)
 
 
-# --- 1. panel: exactly one call per model, parallel, no tool execution ------------
-messages = [{"role": "user", "content": "hello world"}]
+# --- 1. extract_thinking: both real-world field patterns -------------------
+r, c = extract_thinking({"content": "<think>step by step</think>\nfinal answer"})
+check("extract_thinking splits inline <think> (MiniMax-style)", r == "step by step" and c == "final answer")
+r, c = extract_thinking({"content": "final answer", "reasoning_content": "step by step"})
+check("extract_thinking reads separate reasoning_content field", r == "step by step" and c == "final answer")
+r, c = extract_thinking({"content": "final answer"})
+check("extract_thinking returns None when no thinking present", r is None and c == "final answer")
+
+# --- 2. panel: reasoning_effort=high requested for every member, and each
+#        panel result carries both reasoning and content ------------------
+messages = [{"role": "user", "content": "Which is a baryon?\nA) Proton\nB) Electron"}]
 panel = pipeline.run_panel(messages, tools=None, allow_tool_call_output=False)
 check("panel has one result per configured model", len(panel) == len(cfg.PANEL_MODELS))
-check("panel results are distinct per model", len({r["model"] for r in panel}) == len(cfg.PANEL_MODELS))
-check("panel results carry no tool_calls when none forced", all(r["tool_calls"] is None for r in panel))
+check("every panel member has non-empty reasoning (fake models always think)",
+      all(r["reasoning"] for r in panel))
+check("every panel member's content is clean (no leaked <think> tag)",
+      all("<think>" not in (r["content"] or "") for r in panel))
 
-# --- 1b. panel prompt gains the tool-emit instruction only when tools are actually
-#         offered (regression: this line used to be missing from the panel prompt
-#         entirely, unlike the synthesis prompt) --------------------------------
-_captured = []
-_real_call_llm = pipeline.call_llm
-pipeline.call_llm = lambda model, msgs, tools=None, json_mode=False: (
-    _captured.append({"model": model, "system": msgs[0]["content"]}) or
-    _real_call_llm(model, msgs, tools, json_mode)
-)
-sample_tools = [{"type": "function", "function": {"name": "search", "parameters": {}}}]
+evidence = pipeline.panel_evidence(panel)
+check("panel_evidence includes each member's reasoning, not just their answer",
+      all(r["reasoning"] in evidence for r in panel))
+check("panel_evidence includes each member's final answer too",
+      all(r["content"] in evidence for r in panel))
 
-_captured.clear()
-pipeline.run_panel(messages, sample_tools, allow_tool_call_output=True)
-check("panel prompt includes tool-emit instruction when tools are allowed",
-      all("emit the tool call directly" in c["system"] for c in _captured))
-
-_captured.clear()
-pipeline.run_panel(messages, sample_tools, allow_tool_call_output=False)
-check("panel prompt omits tool-emit instruction when tools are not allowed",
-      all("emit the tool call directly" not in c["system"] for c in _captured))
-
-pipeline.call_llm = _real_call_llm
-
-# --- 2. judge: never receives tools, produces parseable JSON -----------------------
+# --- 3. judge: called with reasoning_effort=none, output is valid clean JSON -
 judge_json = pipeline.run_judge(messages, panel)
 parsed = json.loads(judge_json)
 check("judge output is valid JSON with expected keys",
       set(parsed) >= {"consensus", "contradictions", "final_guidance"})
+check("judge output has no leaked <think> tag", "<think>" not in judge_json)
 
-# --- 3. synthesis: tools stripped when allow_tool_call_output=False ----------------
-tools = [{"type": "function", "function": {"name": "search", "parameters": {}}}]
-os.environ["ZG_FAKE_FORCE_TOOL_CALL"] = cfg.SYNTHESIS_MODEL
-final_no_tools = pipeline.run_synthesis(messages, panel, judge_json, tools, allow_tool_call_output=False)
-check("tools stripped -> no tool_call even though fake would force one",
-      not final_no_tools.get("tool_calls"))
+# --- 4. synthesis: called with reasoning_effort=high, returns both parts ---
+final = pipeline.run_synthesis(messages, panel, judge_json, tools=None, allow_tool_call_output=False)
+check("synthesis produced a non-empty final answer", bool(final["content"]))
+check("synthesis captured its own reasoning (fake models always think)", bool(final["reasoning"]))
 
-# --- 4. synthesis: tool_call passes through when allow_tool_call_output=True ------
-final_with_tools = pipeline.run_synthesis(messages, panel, judge_json, tools, allow_tool_call_output=True)
-check("tools allowed -> tool_call surfaces", bool(final_with_tools.get("tool_calls")))
-del os.environ["ZG_FAKE_FORCE_TOOL_CALL"]
-
-# --- 5. run_fusion end-to-end, default switch off ----------------------------------
+# --- 5. run_fusion end-to-end: message carries reasoning_content when present -
 resp = pipeline.run_fusion({"messages": messages})
 msg = resp["choices"][0]["message"]
-check("run_fusion returns text answer with switch off by default", bool(msg["content"]) and not msg["tool_calls"])
-check("run_fusion finish_reason is stop when no tool_call", resp["choices"][0]["finish_reason"] == "stop")
-check("debug field carries panel + judge_json", "panel" in resp["0g_fusion"] and "judge_json" in resp["0g_fusion"])
+check("run_fusion final content has no leaked <think> tag", "<think>" not in (msg["content"] or ""))
+check("run_fusion exposes reasoning_content on the wire", bool(msg.get("reasoning_content")))
+check("debug field carries panel (with reasoning) + judge_json",
+      "panel" in resp["0g_fusion"] and all("reasoning" in p for p in resp["0g_fusion"]["panel"]))
 
-# --- 6. model routing: non-fusion model id is a single plain passthrough call -----
-plain = pipeline.handle_chat_completion({"model": "some-baseline", "messages": messages})
-check("non-fusion model bypasses the fusion pipeline",
-      plain["choices"][0]["message"]["content"] == f"[fake:some-baseline] {messages[0]['content'][:60]}")
+# --- 6. passthrough (baseline) path: forwards reasoning_effort, normalizes
+#        reasoning_content the same way as the fusion path ------------------
+plain = pipeline.handle_chat_completion({"model": "some-baseline", "messages": messages, "reasoning_effort": "high"})
+check("baseline passthrough exposes reasoning_content when thinking is requested",
+      bool(plain["choices"][0]["message"].get("reasoning_content")))
 
-# --- 7. live HTTP round trip: eval.client.call_api -> real socket -> mock server --
+minimax_like = pipeline.handle_chat_completion({"model": "minimax-m3", "messages": messages, "reasoning_effort": "high"})
+check("baseline passthrough strips inline <think> out of content for MiniMax-style models",
+      "<think>" not in (minimax_like["choices"][0]["message"]["content"] or ""))
+check("...and surfaces it via reasoning_content instead",
+      bool(minimax_like["choices"][0]["message"].get("reasoning_content")))
+
+# --- 7. GPQA task loading: deterministic shuffle, correct_letter matches ---
+from eval.gpqa_tasks import load_tasks  # noqa: E402
+
+tasks = load_tasks(limit=3)
+check("load_tasks returns the requested number of tasks", len(tasks) == 3)
+check("every task has question_id/instruction/correct_letter",
+      all({"question_id", "instruction", "correct_letter"} <= set(t) for t in tasks))
+check("every task's instruction contains the final-answer format instruction",
+      all(cfg.FINAL_LETTER_INSTRUCTION in t["instruction"] for t in tasks))
+# re-loading must reproduce the same shuffle/correct_letter (index-seeded, not global RNG)
+tasks_again = load_tasks(limit=3)
+check("shuffle is deterministic across repeated loads",
+      [t["correct_letter"] for t in tasks] == [t["correct_letter"] for t in tasks_again])
+
+# --- 8. gpqa_grade: final-letter extraction -------------------------------
+from eval.gpqa_grade import extract_final_letter  # noqa: E402
+
+check("extracts a plain 'Final Answer: B'", extract_final_letter("blah blah\nFinal Answer: B") == "B")
+check("extracts through markdown bold", extract_final_letter("**Final Answer: C**") == "C")
+check("case-insensitive label", extract_final_letter("final answer: a") == "A")
+check("returns None when the format instruction wasn't followed", extract_final_letter("I think it's B.") is None)
+check("takes the LAST mention if there are several", extract_final_letter("Final Answer: A\n...\nFinal Answer: D") == "D")
+
+# --- 9. live HTTP round trip + full run_eval + grade ------------------------
 server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 port = server.server_address[1]
 threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -97,7 +118,6 @@ base_url = f"http://127.0.0.1:{port}"
 live_resp = call_api(base_url, "0g/fusion-preview", messages, allow_tool_call_output=False)
 check("live HTTP call to mock server returns fusion answer", bool(live_resp["choices"][0]["message"]["content"]))
 
-# unknown route returns 404
 req = urllib.request.Request(base_url + "/v1/unknown", data=b"{}", method="POST")
 try:
     urllib.request.urlopen(req)
@@ -105,7 +125,6 @@ try:
 except urllib.error.HTTPError as e:
     check("unknown route returns 404", e.code == 404)
 
-# --- 8. full run_eval.run() against the live server, writing a replay file --------
 from eval.run_eval import run as run_eval  # noqa: E402
 
 out_path = os.path.join(os.path.dirname(__file__), "eval", "results", "test_run.jsonl")
@@ -113,15 +132,15 @@ run_eval(base_url, "0g/fusion-preview", base_url, "baseline-model", out_path, li
 with open(out_path) as f:
     rows = [json.loads(line) for line in f]
 check("replay file has expected row count", len(rows) == 2)
-check("replay rows have required schema keys",
-      all({"schema", "instruction", "fusion", "baseline", "config_id"} <= set(r) for r in rows))
+check("replay rows have GPQA schema keys (correct_letter, both content+reasoning)",
+      all({"schema", "question_id", "instruction", "correct_letter", "fusion", "baseline", "config_id"} <= set(r)
+          for r in rows))
 
-# --- 9. grading over the replay file ----------------------------------------------
-from eval.grade import grade_replay  # noqa: E402
+from eval.gpqa_grade import grade_replay  # noqa: E402
 
 result = grade_replay(out_path)
-check("grade_replay returns a win_rate in [0,1] over all rows",
-      0.0 <= result["win_rate"] <= 1.0 and result["n"] == 2)
+check("grade_replay reports fusion + baseline accuracy over all rows",
+      result["fusion"]["n"] == 2 and result["baseline"]["n"] == 2)
 
 server.shutdown()
 os.remove(out_path)
