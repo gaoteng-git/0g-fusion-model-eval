@@ -40,6 +40,16 @@ check("extract_thinking reads separate reasoning_content field", r == "step by s
 r, c = extract_thinking({"content": "final answer"})
 check("extract_thinking returns None when no thinking present", r is None and c == "final answer")
 
+r, c = extract_thinking({"content": "Let me consider this. <think>step by step</think>\nfinal answer"})
+check("extract_thinking keeps text preceding the <think> tag instead of silently dropping it",
+      c == "Let me consider this. \nfinal answer")
+
+r, c = extract_thinking({"content": "<think>first</think>mid<think>second</think>final answer"})
+check("extract_thinking strips ALL <think> blocks, not just the first",
+      "<think>" not in c and "</think>" not in c)
+check("extract_thinking joins every <think> block's text into reasoning, not just the first",
+      "first" in r and "second" in r)
+
 # --- 2. panel: reasoning_effort=high requested for every member, and each
 #        panel result carries both reasoning and content ------------------
 messages = [{"role": "user", "content": "Which is a baryon?\nA) Proton\nB) Electron"}]

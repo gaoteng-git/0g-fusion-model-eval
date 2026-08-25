@@ -26,7 +26,7 @@ FAKE = not UPSTREAM_BASE_URL  # no upstream configured -> deterministic offline 
 REASONING_ON = "high"    # any value other than none/minimal turns thinking on
 REASONING_OFF = "none"   # turns thinking off where the model has a native toggle
 
-_THINK_TAG_RE = re.compile(r"<think>(.*?)</think>\s*(.*)", re.DOTALL)
+_THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
 # Every call's full input/output is logged to
 #   <LOG_DIR>/<experiment>__<role>__<model>.jsonl   (one JSON line appended per call)
@@ -107,14 +107,23 @@ def extract_thinking(message):
     models: a separate `reasoning_content` field (the common case), or
     inline <think>...</think> markup in `content` (MiniMax-M3). Returns
     (None, content) when neither is present (e.g. a model with thinking off).
+
+    Extracts ALL <think>...</think> blocks, not just the first -- an earlier
+    version used a single search() + "everything after the first </think>"
+    split, which silently dropped any text before the first <think> tag and
+    left a second think block (if the model ever emits more than one)
+    un-stripped inside the returned content. Both were real, demonstrated
+    failure modes, not hypothetical.
     """
     reasoning_content = message.get("reasoning_content")
     content = message.get("content") or ""
     if reasoning_content:
         return reasoning_content, content
-    m = _THINK_TAG_RE.search(content)
-    if m:
-        return m.group(1).strip(), m.group(2).strip()
+    blocks = _THINK_BLOCK_RE.findall(content)
+    if blocks:
+        reasoning = "\n\n".join(b.strip() for b in blocks)
+        clean_content = _THINK_BLOCK_RE.sub("", content).strip()
+        return reasoning, clean_content
     return None, content
 
 
