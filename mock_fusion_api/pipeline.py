@@ -13,6 +13,13 @@ before being treated as JSON -- see llm_client.extract_thinking. Panel evidence
 fed to judge/synthesis includes each member's reasoning AND its final answer,
 not content alone.
 
+Judge JSON validity is not enforced (see JUDGE_MODELS_WITHOUT_JSON_MODE) --
+run_judge validates it with json.loads() purely to print a clear stderr
+warning naming the question (request["question_id"], if the eval harness set
+one) and judge model on failure, then continues into synthesis regardless. A
+malformed judge JSON degrades one question's evidence quality; it must not
+abort the run.
+
 Cost-saving reuse: a request may pass `cached_panel` (already-computed panel
 entries) plus `extra_panel_models` (model IDs to actually call fresh) instead
 of `model: "0g/fusion*"` triggering a full fresh panel -- see run_fusion's
@@ -28,6 +35,8 @@ the full request+response of each call to
 call_logs/<experiment>__<role>__<model>.jsonl -- see llm_client.py's
 _log_call. No experiment name -> no log files (keeps tests/dev calls quiet).
 """
+import json
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 from llm_client import call_llm, extract_thinking, REASONING_ON, REASONING_OFF
@@ -118,19 +127,49 @@ def _messages_text(messages):
     return "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages if m.get("content"))
 
 
-def run_judge(messages, panel_results, experiment=None):
+def run_judge(messages, panel_results, experiment=None, question_id=None):
     """One call. tools is always None here -- unaffected by allow_tool_call_output.
     Thinking is explicitly requested OFF (reasoning_effort=none); any leaked
     <think> block is stripped defensively before the content is treated as the
     judge's JSON -- a judge that thinks anyway must not have its reasoning
-    silently corrupt the JSON payload downstream stages parse."""
+    silently corrupt the JSON payload downstream stages parse.
+
+    json_mode (response_format: json_object) is only sent when JUDGE_MODEL is
+    NOT in cfg.JUDGE_MODELS_WITHOUT_JSON_MODE -- 0g-router hard-rejects
+    response_format for any model that doesn't advertise it as a supported
+    parameter (400 model_not_capable), independent of reasoning_effort or
+    anything else in the request. For those models, JSON compliance falls
+    back to JUDGE_SYSTEM's own "Return only JSON" instruction alone -- no
+    stricter than that, by design (see JUDGE_MODELS_WITHOUT_JSON_MODE's
+    comment for why this is an intentional match to production's own
+    minimax-m3 judge, not an oversight).
+
+    Because that fallback has no structural guarantee, the output is
+    validated with json.loads() purely for VISIBILITY: on failure this prints
+    a single clear stderr line naming the question and judge model, but still
+    returns the raw text and lets the pipeline continue into synthesis
+    unchanged -- a malformed judge JSON degrades that one question's evidence
+    quality, it must not abort the run. question_id (set by the eval harness,
+    e.g. run_eval.py's task["question_id"]) is only used for this message; a
+    caller that never sets it (e.g. debug_fusion_call.py) just gets `None` in
+    the log line instead of a real id."""
     evidence = panel_evidence(panel_results).split("Panel answers:\n", 1)[-1]
     user = f"Original request summary:\n{_messages_text(messages)}\n\nPanel responses:\n{evidence}"
+    supports_json_mode = (cfg.JUDGE_MODEL or "").strip().lower() not in cfg.JUDGE_MODELS_WITHOUT_JSON_MODE
     msg = call_llm(cfg.JUDGE_MODEL,
                     [{"role": "system", "content": cfg.JUDGE_SYSTEM}, {"role": "user", "content": user}],
-                    json_mode=True, reasoning_effort=REASONING_OFF, experiment=experiment, role="judge")
+                    json_mode=supports_json_mode, reasoning_effort=REASONING_OFF, experiment=experiment, role="judge")
     _, clean_content = extract_thinking(msg)
-    return clean_content or "{}"
+    judge_json = clean_content or "{}"
+    try:
+        json.loads(judge_json)
+    except json.JSONDecodeError as e:
+        print(
+            f"fusion.judge_json_invalid question_id={question_id!r} judge_model={cfg.JUDGE_MODEL!r} "
+            f"error={str(e)!r} raw_len={len(judge_json)}",
+            file=sys.stderr,
+        )
+    return judge_json
 
 
 def run_synthesis(messages, panel_results, judge_json, tools, allow_tool_call_output, experiment=None):
@@ -179,6 +218,7 @@ def run_fusion(request):
     tools = request.get("tools")
     allow = bool(request.get("allow_tool_call_output", False))
     experiment = request.get("experiment")
+    question_id = request.get("question_id")
     cached_panel = request.get("cached_panel")
     extra_panel_models = request.get("extra_panel_models")
     if cached_panel is not None or extra_panel_models is not None:
@@ -189,7 +229,7 @@ def run_fusion(request):
         panel_results = cached_panel + fresh
     else:
         panel_results = run_panel(messages, tools, allow, experiment=experiment)
-    judge_json = run_judge(messages, panel_results, experiment=experiment)
+    judge_json = run_judge(messages, panel_results, experiment=experiment, question_id=question_id)
     final = run_synthesis(messages, panel_results, judge_json, tools, allow, experiment=experiment)
     tool_calls = final.get("tool_calls")
     message = {"role": "assistant", "content": final.get("content"), "tool_calls": tool_calls}

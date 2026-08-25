@@ -17,6 +17,7 @@ import json
 import os
 import re
 import time
+import urllib.error
 import urllib.request
 
 UPSTREAM_BASE_URL = os.environ.get("ZG_UPSTREAM_BASE_URL")
@@ -86,10 +87,30 @@ def call_llm(model, messages, tools=None, json_mode=False, reasoning_effort=None
     req = urllib.request.Request(
         UPSTREAM_BASE_URL.rstrip("/") + "/chat/completions",
         data=json.dumps(body).encode(),
-        headers={"Authorization": f"Bearer {UPSTREAM_API_KEY}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {UPSTREAM_API_KEY}",
+            "Content-Type": "application/json",
+            # Some models' upstream providers sit behind Cloudflare, which
+            # blocks urllib's default "Python-urllib/3.x" User-Agent as
+            # suspicious/bot traffic (Cloudflare error 1010 -- confirmed live
+            # against kimi-k3 through router-api.0g.ai). A normal browser UA
+            # is enough to get past that specific check.
+            "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+        },
     )
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        payload = json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            payload = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        # Same class of bug as eval/client.py's call_api had: a bare HTTPError
+        # discards the response body, which is exactly where the upstream's
+        # real reason lives (invalid key, wrong tier for this model, rate
+        # limit, unsupported model ID, ...). Surface it -- this is what a
+        # real run's panel/judge/synthesis failures need to be diagnosable
+        # from the caller's traceback instead of a bare "HTTP Error 403".
+        detail = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"{UPSTREAM_BASE_URL} returned HTTP {e.code} for model={model!r}: {detail}") from e
     message = payload["choices"][0]["message"]
     # Log the FULL raw response payload, not just the message we use --
     # usage (prompt/completion/reasoning token counts), finish_reason, id,

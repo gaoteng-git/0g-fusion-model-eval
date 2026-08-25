@@ -22,7 +22,7 @@ def run(fusion_url, fusion_model, baseline_url, baseline_model, out_path, limit=
         for task in tasks:
             messages = [{"role": "user", "content": task["instruction"]}]
             fusion_resp = call_api(fusion_url, fusion_model, messages, allow_tool_call_output=False,
-                                    experiment=experiment)
+                                    experiment=experiment, question_id=task["question_id"])
             baseline_resp = call_api(baseline_url, baseline_model, messages, reasoning_effort="high",
                                       experiment=experiment)
             row = {

@@ -8,7 +8,9 @@ per-call log-file naming/content (call_logs/<experiment>__<role>__<model>.jsonl)
 and the cached_panel/extra_panel_models partial-reuse mode (run_variant.py).
 Run: python3 tests.py
 """
+import contextlib
 import glob
+import io
 import json
 import os
 import shutil
@@ -110,6 +112,61 @@ check("judge output is valid JSON with expected keys",
       set(parsed) >= {"consensus", "contradictions", "final_guidance"})
 check("judge output has no leaked <think> tag", "<think>" not in judge_json)
 
+# --- 3b. json_mode is withheld for judge models in JUDGE_MODELS_WITHOUT_JSON_MODE
+#         (0g-router hard-rejects response_format for a model that doesn't
+#         advertise it -- confirmed live: a real 400 model_not_capable against
+#         minimax-m3) -- and still sent for every other model (regression) ---
+_orig_call_llm = pipeline.call_llm
+_orig_judge_model = cfg.JUDGE_MODEL
+_seen_json_mode = {}
+
+
+def _capture_json_mode(model, msgs, tools=None, json_mode=False, **kw):
+    _seen_json_mode["value"] = json_mode
+    return _orig_call_llm(model, msgs, tools, json_mode=json_mode, **kw)
+
+
+pipeline.call_llm = _capture_json_mode
+try:
+    cfg.JUDGE_MODEL = "judge-model"  # not in JUDGE_MODELS_WITHOUT_JSON_MODE
+    pipeline.run_judge(messages, panel)
+    check("json_mode is still sent for a judge model that supports response_format",
+          _seen_json_mode["value"] is True)
+
+    cfg.JUDGE_MODEL = "minimax-m3"  # confirmed real 0g-router 400 case
+    stderr_capture = io.StringIO()
+    with contextlib.redirect_stderr(stderr_capture):
+        result = pipeline.run_judge(messages, panel, question_id=42)
+    check("json_mode is withheld for minimax-m3 (JUDGE_MODELS_WITHOUT_JSON_MODE)",
+          _seen_json_mode["value"] is False)
+    check("run_judge with minimax-m3 as judge still returns a usable string, no crash",
+          isinstance(result, str) and len(result) > 0)
+    warning = stderr_capture.getvalue()
+    check("malformed judge JSON (FAKE minimax-m3's non-JSON text) prints a clear stderr warning "
+          "naming the question_id and judge model",
+          "fusion.judge_json_invalid" in warning and "question_id=42" in warning
+          and "judge_model='minimax-m3'" in warning)
+
+    cfg.JUDGE_MODEL = "judge-model"
+    stderr_capture2 = io.StringIO()
+    with contextlib.redirect_stderr(stderr_capture2):
+        pipeline.run_judge(messages, panel, question_id=7)
+    check("no warning is printed when the judge's output IS valid JSON (no false positives)",
+          stderr_capture2.getvalue() == "")
+
+    # 0g-router resolves model ids case-insensitively (models.yaml: "MiniMax-M3"
+    # "differs from canonical only by case") -- the local check must match that,
+    # or a differently-cased ZG_JUDGE_MODEL would slip json_mode=True back
+    # through and reproduce the exact live 400 this was built to avoid.
+    for variant in ("MiniMax-M3", "MINIMAX-M3", "  minimax-m3  ", "minimax/minimax-m3"):
+        cfg.JUDGE_MODEL = variant
+        pipeline.run_judge(messages, panel)
+        check(f"json_mode withheld regardless of casing/whitespace ({variant!r})",
+              _seen_json_mode["value"] is False)
+finally:
+    pipeline.call_llm = _orig_call_llm
+    cfg.JUDGE_MODEL = _orig_judge_model
+
 # --- 4. synthesis: called with reasoning_effort=high, returns both parts ---
 final = pipeline.run_synthesis(messages, panel, judge_json, tools=None, allow_tool_call_output=False)
 check("synthesis produced a non-empty final answer", bool(final["content"]))
@@ -122,6 +179,19 @@ check("run_fusion final content has no leaked <think> tag", "<think>" not in (ms
 check("run_fusion exposes reasoning_content on the wire", bool(msg.get("reasoning_content")))
 check("debug field carries panel (with reasoning) + judge_json",
       "panel" in resp["0g_fusion"] and all("reasoning" in p for p in resp["0g_fusion"]["panel"]))
+
+# request["question_id"] must reach run_judge (via run_fusion) so a malformed
+# judge JSON can actually be traced back to which question caused it
+_orig_judge_model2 = cfg.JUDGE_MODEL
+cfg.JUDGE_MODEL = "minimax-m3"
+try:
+    stderr_capture3 = io.StringIO()
+    with contextlib.redirect_stderr(stderr_capture3):
+        pipeline.run_fusion({"messages": messages, "question_id": 99})
+    check("run_fusion forwards request['question_id'] through to run_judge's warning",
+          "question_id=99" in stderr_capture3.getvalue())
+finally:
+    cfg.JUDGE_MODEL = _orig_judge_model2
 
 # --- 6. passthrough (baseline) path: forwards reasoning_effort, normalizes
 #        reasoning_content the same way as the fusion path ------------------
@@ -176,6 +246,17 @@ try:
     check("unknown route returns 404", False)
 except urllib.error.HTTPError as e:
     check("unknown route returns 404", e.code == 404)
+
+# call_api must surface the server's real error body on a 500, not a bare
+# HTTPError with the body silently discarded -- this is exactly what made a
+# real 500 from pipeline.run_fusion (e.g. a malformed cached_panel entry)
+# undiagnosable from run_eval.py's traceback until this was fixed.
+try:
+    call_api(base_url, "0g/fusion-preview", messages, cached_panel=[{"content": "missing model key"}])
+    check("call_api surfaces the real error body on HTTP 500 instead of a bare HTTPError", False)
+except RuntimeError as e:
+    check("call_api surfaces the real error body on HTTP 500 instead of a bare HTTPError",
+          "500" in str(e) and "cached_panel" in str(e))
 
 from eval.run_eval import run as run_eval  # noqa: E402
 
@@ -259,8 +340,12 @@ FAKE_UPSTREAM_PAYLOAD = {
 }
 
 
+_seen_headers = {}
+
+
 class _FakeUpstreamHandler(BaseHTTPRequestHandler):
     def do_POST(self):
+        _seen_headers["user_agent"] = self.headers.get("User-Agent")
         body = json.dumps(FAKE_UPSTREAM_PAYLOAD).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -288,6 +373,10 @@ upstream.shutdown()
 
 check("real HTTP path still returns just the message to the caller (unchanged contract)",
       msg == FAKE_UPSTREAM_PAYLOAD["choices"][0]["message"])
+check("real HTTP path sends a non-default User-Agent (avoids Cloudflare error 1010 -- "
+      "confirmed live against kimi-k3 through router-api.0g.ai, urllib's default UA got 403'd)",
+      _seen_headers.get("user_agent") not in (None, "", "Python-urllib/3.10")
+      and "python-urllib" not in (_seen_headers.get("user_agent") or "").lower())
 
 realcheck_log = os.path.join(llm_client.LOG_DIR, f"{TEST_EXPERIMENT}__realcheck__some-model.jsonl")
 with open(realcheck_log, encoding="utf-8") as f:
@@ -303,6 +392,40 @@ for f in glob.glob(os.path.join(llm_client.LOG_DIR, f"{TEST_EXPERIMENT}__*")):
     os.remove(f)
 if os.path.isdir(llm_client.LOG_DIR) and not os.listdir(llm_client.LOG_DIR):
     shutil.rmtree(llm_client.LOG_DIR)
+
+# --- 11b. a real 403/etc from upstream must surface its actual body, not a
+#          bare "HTTP Error 403: Forbidden" with the reason discarded -- this
+#          is the exact bug a real run against pc.0g.ai/staging hit ---------
+class _FakeUpstream403Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = json.dumps({"error": {"message": "invalid api key for this model tier"}}).encode()
+        self.send_response(403)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+upstream403 = ThreadingHTTPServer(("127.0.0.1", 0), _FakeUpstream403Handler)
+upstream403_port = upstream403.server_address[1]
+threading.Thread(target=upstream403.serve_forever, daemon=True).start()
+time.sleep(0.1)
+
+_orig_fake, _orig_base_url = llm_client.FAKE, llm_client.UPSTREAM_BASE_URL
+llm_client.FAKE = False
+llm_client.UPSTREAM_BASE_URL = f"http://127.0.0.1:{upstream403_port}"
+try:
+    llm_client.call_llm("some-model", messages)
+    check("call_llm surfaces the real upstream error body on HTTP 403", False)
+except RuntimeError as e:
+    check("call_llm surfaces the real upstream error body on HTTP 403",
+          "403" in str(e) and "invalid api key for this model tier" in str(e))
+finally:
+    llm_client.FAKE, llm_client.UPSTREAM_BASE_URL = _orig_fake, _orig_base_url
+    upstream403.shutdown()
 
 # --- 12. cached_panel / extra_panel_models: partial-reuse mode -------------
 _cached_entry = {"model": "cached-model-x", "content": "CACHED ANSWER\nFinal Answer: A",

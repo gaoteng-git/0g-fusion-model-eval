@@ -42,7 +42,7 @@ def run(base_replay_path, fusion_url, fusion_model, variant_model, out_path, lim
             fusion_resp = call_api(
                 fusion_url, fusion_model, messages,
                 cached_panel=cached_panel, extra_panel_models=[variant_model],
-                experiment=experiment,
+                experiment=experiment, question_id=base_row["question_id"],
             )
             row = {
                 "schema": "0g.fusion_eval.gpqa.replay.v1",
