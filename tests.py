@@ -65,6 +65,43 @@ check("panel_evidence includes each member's reasoning, not just their answer",
       all(r["reasoning"] in evidence for r in panel))
 check("panel_evidence includes each member's final answer too",
       all(r["content"] in evidence for r in panel))
+# Note: can't assert the model name string is absent from `evidence` outright --
+# FAKE mode's own simulated answer text embeds "[fake:<model>] ..." by design
+# (see llm_client._fake_llm), so the model name legitimately shows up as part
+# of a panel member's own *answer*. What must be absent is panel_evidence's
+# own "model=<name>" attribution tag (production's fusionPanelEvidence has
+# this; this eval deliberately drops it -- see panel_evidence's docstring).
+check("panel_evidence does NOT add its own model= attribution tag (anonymized by position, unlike production)",
+      "model=" not in evidence)
+
+# --- 2b. FINAL_LETTER_INSTRUCTION must not be duplicated: it's already baked
+#         into the caller's own question text (gpqa_tasks.py); _panel_messages
+#         / run_synthesis must not re-add a second copy on top -------------
+_msg_with_instruction = [{"role": "user", "content": f"Some question?\n\n{cfg.FINAL_LETTER_INSTRUCTION}"}]
+_orig_call_llm = pipeline.call_llm
+_captured = []
+
+
+def _capture_call_llm(model, msgs, *a, **kw):
+    _captured.append(msgs)
+    return _orig_call_llm(model, msgs, *a, **kw)
+
+
+pipeline.call_llm = _capture_call_llm
+try:
+    _captured.clear()
+    pipeline.run_panel(_msg_with_instruction, tools=None, allow_tool_call_output=False)
+    check("_panel_messages does not re-add a 2nd copy of FINAL_LETTER_INSTRUCTION",
+          all(sum(m.get("content", "").count(cfg.FINAL_LETTER_INSTRUCTION) for m in sent) == 1
+              for sent in _captured))
+
+    _captured.clear()
+    pipeline.run_synthesis(_msg_with_instruction, panel, "{}", tools=None, allow_tool_call_output=False)
+    combined = "\n".join(m.get("content", "") for m in _captured[0])
+    check("run_synthesis does not re-add a 2nd copy of FINAL_LETTER_INSTRUCTION",
+          combined.count(cfg.FINAL_LETTER_INSTRUCTION) == 1)
+finally:
+    pipeline.call_llm = _orig_call_llm
 
 # --- 3. judge: called with reasoning_effort=none, output is valid clean JSON -
 judge_json = pipeline.run_judge(messages, panel)

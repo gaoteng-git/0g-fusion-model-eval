@@ -40,8 +40,14 @@ def _tools_for(tools, allow):
 
 
 def _panel_messages(messages, index, allowed_tools):
+    # FINAL_LETTER_INSTRUCTION is deliberately NOT re-added here: it's already
+    # baked into the caller's own question text (see eval/gpqa_tasks.py), the
+    # only place it can live and still reach the baseline model too (which
+    # never goes through this function). Re-adding it here would (a) literally
+    # duplicate the exact same instruction the model already sees in the user
+    # turn, and (b) wrongly hardcode a GPQA-specific "this is multiple choice"
+    # assumption into this otherwise task-agnostic pipeline code.
     system = f"You are 0G Fusion panel member {index + 1}.\n\n{cfg.PANEL_FALLBACK_PROMPT}"
-    system += "\n\n" + cfg.FINAL_LETTER_INSTRUCTION
     if allowed_tools:
         system += "\n\nIf the next correct step is a provided function call, emit the tool call directly instead of describing it."
     return [{"role": "system", "content": system}] + messages
@@ -82,7 +88,20 @@ def tool_calls_text(tool_calls):
 
 def panel_evidence(panel_results):
     """Formats each panel member's REASONING and FINAL ANSWER as evidence --
-    both parts, not content alone -- for the judge and synthesis stages."""
+    both parts, not content alone -- for the judge and synthesis stages.
+
+    Deliberately anonymized: entries are labeled only by position ([1]/[2]/...),
+    never by model name, even though production's fusionPanelEvidence does
+    include `model=...`. Production has its own reasons for that (letting
+    judge/synthesis weight known per-provider domain strengths); for THIS
+    eval's purpose -- cleanly comparing whether a candidate model is a better
+    5th panel member -- leaking model identity into the judge/synthesis
+    prompt risks a real confound: any brand/provider bias baked into the
+    judge or synthesis model's own training would then contaminate the
+    comparison, independent of actual answer quality. The real model name is
+    still preserved in the returned panel_results / 0g_fusion.panel / call
+    logs for debugging -- only the text actually sent to judge/synthesis
+    drops it."""
     lines = ["Panel answers:"]
     for i, r in enumerate(panel_results):
         answer = (r["content"] or "").strip()
@@ -91,7 +110,7 @@ def panel_evidence(panel_results):
             answer = f"{answer}\n{tc}" if answer else tc
         reasoning = (r.get("reasoning") or "").strip()
         block = f"Reasoning:\n{reasoning}\n\nFinal answer:\n{answer}" if reasoning else answer
-        lines.append(f"\n[{i + 1}] model={r['model']}\n{block}\n")
+        lines.append(f"\n[{i + 1}]\n{block}\n")
     return "\n".join(lines)
 
 
@@ -119,7 +138,10 @@ def run_synthesis(messages, panel_results, judge_json, tools, allow_tool_call_ou
     is True. Reads the panel's reasoning AND final answers (via panel_evidence),
     not just their answers."""
     allowed_tools = _tools_for(tools, allow_tool_call_output)
-    instruction = cfg.SYNTHESIS_FALLBACK_PROMPT + "\n\n" + cfg.FINAL_LETTER_INSTRUCTION
+    # Same reasoning as _panel_messages: not re-adding FINAL_LETTER_INSTRUCTION
+    # here -- `messages` (appended below) already carries the caller's
+    # original question, which already has it baked in.
+    instruction = cfg.SYNTHESIS_FALLBACK_PROMPT
     if allowed_tools:
         instruction += ("\n\nIf the next correct action is a provided function call, emit the tool "
                          "call directly instead of describing it in text. Return visible text only "
