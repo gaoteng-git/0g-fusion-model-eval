@@ -57,3 +57,44 @@ offline testing only — swap in the real (CSV or same-shaped JSONL) file via
 whether the panel/synthesis stages may see caller `tools` and emit a
 `tool_call` — unrelated to thinking, and unused by this GPQA round (no tools
 are sent).
+
+## Reusing fixed panel members across variant runs
+
+If you're testing several candidate 5th panel members against the same 4
+fixed ones (e.g. 3 MiMo-candidate variants), don't re-pay for the 4 unchanged
+panel calls each time. `run_fusion` accepts two extra request fields:
+
+- `cached_panel`: a list of already-computed panel entries (the shape
+  `run_panel` produces: `model`/`content`/`reasoning`/`tool_calls`), used
+  as-is with no LLM call made for them.
+- `extra_panel_models`: model IDs actually called fresh this round.
+
+When either is present, `cfg.PANEL_MODELS` is ignored entirely — the caller
+fully controls the panel composition for that call. Judge + synthesis then
+run once, over the merged (cached + fresh) panel, same as always.
+
+`eval/run_variant.py` drives this from a prior `run_eval.py` replay file
+(whose `fusion.raw_response["0g_fusion"]["panel"]` already holds the full
+per-question panel breakdown — nothing extra needs capturing):
+
+```
+python3 -m eval.run_eval --out eval/results/base.jsonl        # once, with the 4 fixed panel models
+python3 -m eval.run_variant --base-replay eval/results/base.jsonl \
+    --variant-model xiaomi/mimo-v2.5-pro --out eval/results/variant_mimo.jsonl
+python3 -m eval.gpqa_grade eval/results/variant_mimo.jsonl
+```
+Each variant run only pays for 1 panel call + judge + synthesis, not all 5
+panel calls again. The baseline side isn't re-called either — it's carried
+over unchanged from the base replay row.
+
+## Per-call logging
+
+Every `call_llm()` call (panel/judge/synthesis/baseline) is logged in full —
+the entire request body and the entire raw response payload (not just the
+message: `usage`, `finish_reason`, `id`, the actually-served model too) — to
+`call_logs/<experiment>__<role>__<model>.jsonl`, one JSON line appended per
+call. Logging only fires when the caller passes an `experiment` name
+(`run_eval.py`/`run_variant.py`'s `--experiment`, defaulted if not given);
+calls with no experiment name (tests, ad-hoc pokes) write nothing.
+`call_logs/` is gitignored — for a real run these files contain real GPQA
+question text end to end, same anti-leakage handling as `eval/data/*`.

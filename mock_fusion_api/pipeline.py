@@ -12,6 +12,21 @@ Thinking (GPQA round): panel and synthesis are called with reasoning_effort=high
 before being treated as JSON -- see llm_client.extract_thinking. Panel evidence
 fed to judge/synthesis includes each member's reasoning AND its final answer,
 not content alone.
+
+Cost-saving reuse: a request may pass `cached_panel` (already-computed panel
+entries) plus `extra_panel_models` (model IDs to actually call fresh) instead
+of `model: "0g/fusion*"` triggering a full fresh panel -- see run_fusion's
+docstring and eval/run_variant.py, which uses this to re-run judge+synthesis
+against a swapped-in 5th panel member without re-paying for the 4 unchanged
+ones.
+
+Call logging: every call_llm() invocation here is tagged with a `role`
+("panel"/"judge"/"synthesis" for the fusion path, "baseline" for the plain
+passthrough path) and forwards request["experiment"] (set by the eval
+harness, e.g. run_eval.py's --experiment) straight through. llm_client writes
+the full request+response of each call to
+call_logs/<experiment>__<role>__<model>.jsonl -- see llm_client.py's
+_log_call. No experiment name -> no log files (keeps tests/dev calls quiet).
 """
 from concurrent.futures import ThreadPoolExecutor
 
@@ -32,18 +47,30 @@ def _panel_messages(messages, index, allowed_tools):
     return [{"role": "system", "content": system}] + messages
 
 
-def run_panel(messages, tools, allow_tool_call_output):
+def run_panel(messages, tools, allow_tool_call_output, experiment=None, models=None, start_index=0):
     """Every panel model is called exactly once, concurrently, with thinking on.
-    No iteration, no tool execution."""
+    No iteration, no tool execution.
+
+    `models` overrides cfg.PANEL_MODELS -- used when only a subset of the
+    panel needs to be called fresh this round (see run_fusion's
+    cached_panel/extra_panel_models handling below). `start_index` offsets
+    the "panel member N" system-prompt numbering so a partially-cached call
+    still numbers the freshly-called members the way a from-scratch run of
+    the full panel would (member numbering is per-model-call context only;
+    it does not leak into judge/synthesis, which number panel_evidence
+    entries independently by their position in the final merged list)."""
+    models = cfg.PANEL_MODELS if models is None else models
     def one(item):
-        index, model = item
+        offset, model = item
         allowed_tools = _tools_for(tools, allow_tool_call_output)
-        msg = call_llm(model, _panel_messages(messages, index, allowed_tools), allowed_tools,
-                        reasoning_effort=REASONING_ON)
+        msg = call_llm(model, _panel_messages(messages, start_index + offset, allowed_tools), allowed_tools,
+                        reasoning_effort=REASONING_ON, experiment=experiment, role="panel")
         reasoning, content = extract_thinking(msg)
         return {"model": model, "content": content, "reasoning": reasoning, "tool_calls": msg.get("tool_calls")}
-    with ThreadPoolExecutor(max_workers=len(cfg.PANEL_MODELS)) as pool:
-        return list(pool.map(one, enumerate(cfg.PANEL_MODELS)))
+    if not models:
+        return []
+    with ThreadPoolExecutor(max_workers=len(models)) as pool:
+        return list(pool.map(one, enumerate(models)))
 
 
 def tool_calls_text(tool_calls):
@@ -72,7 +99,7 @@ def _messages_text(messages):
     return "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages if m.get("content"))
 
 
-def run_judge(messages, panel_results):
+def run_judge(messages, panel_results, experiment=None):
     """One call. tools is always None here -- unaffected by allow_tool_call_output.
     Thinking is explicitly requested OFF (reasoning_effort=none); any leaked
     <think> block is stripped defensively before the content is treated as the
@@ -82,12 +109,12 @@ def run_judge(messages, panel_results):
     user = f"Original request summary:\n{_messages_text(messages)}\n\nPanel responses:\n{evidence}"
     msg = call_llm(cfg.JUDGE_MODEL,
                     [{"role": "system", "content": cfg.JUDGE_SYSTEM}, {"role": "user", "content": user}],
-                    json_mode=True, reasoning_effort=REASONING_OFF)
+                    json_mode=True, reasoning_effort=REASONING_OFF, experiment=experiment, role="judge")
     _, clean_content = extract_thinking(msg)
     return clean_content or "{}"
 
 
-def run_synthesis(messages, panel_results, judge_json, tools, allow_tool_call_output):
+def run_synthesis(messages, panel_results, judge_json, tools, allow_tool_call_output, experiment=None):
     """One call, with thinking on. tools passed through only if allow_tool_call_output
     is True. Reads the panel's reasoning AND final answers (via panel_evidence),
     not just their answers."""
@@ -99,20 +126,49 @@ def run_synthesis(messages, panel_results, judge_json, tools, allow_tool_call_ou
                          "when no tool call is needed.")
     user = f"{instruction}\n\n{panel_evidence(panel_results)}\n\nJudge analysis JSON:\n{judge_json}"
     msg = call_llm(cfg.SYNTHESIS_MODEL, messages + [{"role": "user", "content": user}], allowed_tools,
-                    reasoning_effort=REASONING_ON)
+                    reasoning_effort=REASONING_ON, experiment=experiment, role="synthesis")
     reasoning, content = extract_thinking(msg)
     return {"content": content, "reasoning": reasoning, "tool_calls": msg.get("tool_calls")}
 
 
+def _validate_cached_panel(cached_panel):
+    for i, entry in enumerate(cached_panel):
+        missing = [k for k in ("model", "content") if k not in entry]
+        if missing:
+            raise ValueError(f"cached_panel[{i}] missing required key(s) {missing}: got keys {list(entry)}")
+
+
 def run_fusion(request):
     """panel (parallel x1, thinking on) -> judge (x1, thinking off) ->
-    synthesis (x1, thinking on). No loops anywhere."""
+    synthesis (x1, thinking on). No loops anywhere.
+
+    Partial-reuse mode: if the request carries `cached_panel` and/or
+    `extra_panel_models`, cfg.PANEL_MODELS is NOT consulted at all -- the
+    caller fully controls this call's panel composition. `cached_panel` is a
+    list of already-computed panel entries (same shape run_panel produces:
+    model/content/reasoning/tool_calls) that are used as-is, no LLM call
+    made for them; `extra_panel_models` are model IDs actually called fresh
+    this round. This is what lets a caller re-run judge+synthesis against a
+    swapped-in panel member without re-paying for the other, unchanged
+    panel members -- see eval/run_variant.py, which drives this by reading
+    a prior run's replay file (fusion.raw_response.0g_fusion.panel) as the
+    cached_panel for later variant runs."""
     messages = request["messages"]
     tools = request.get("tools")
     allow = bool(request.get("allow_tool_call_output", False))
-    panel_results = run_panel(messages, tools, allow)
-    judge_json = run_judge(messages, panel_results)
-    final = run_synthesis(messages, panel_results, judge_json, tools, allow)
+    experiment = request.get("experiment")
+    cached_panel = request.get("cached_panel")
+    extra_panel_models = request.get("extra_panel_models")
+    if cached_panel is not None or extra_panel_models is not None:
+        cached_panel = list(cached_panel or [])
+        _validate_cached_panel(cached_panel)
+        fresh = run_panel(messages, tools, allow, experiment=experiment,
+                           models=extra_panel_models or [], start_index=len(cached_panel))
+        panel_results = cached_panel + fresh
+    else:
+        panel_results = run_panel(messages, tools, allow, experiment=experiment)
+    judge_json = run_judge(messages, panel_results, experiment=experiment)
+    final = run_synthesis(messages, panel_results, judge_json, tools, allow, experiment=experiment)
     tool_calls = final.get("tool_calls")
     message = {"role": "assistant", "content": final.get("content"), "tool_calls": tool_calls}
     if final.get("reasoning"):
@@ -135,7 +191,8 @@ def handle_chat_completion(request):
         return run_fusion(request)
     allow = bool(request.get("allow_tool_call_output", False))
     msg = call_llm(request["model"], request["messages"], _tools_for(request.get("tools"), allow),
-                    reasoning_effort=request.get("reasoning_effort"))
+                    reasoning_effort=request.get("reasoning_effort"),
+                    experiment=request.get("experiment"), role="baseline")
     reasoning, content = extract_thinking(msg)
     tool_calls = msg.get("tool_calls")
     message = {"role": "assistant", "content": content, "tool_calls": tool_calls}

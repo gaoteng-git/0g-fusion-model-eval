@@ -3,6 +3,13 @@ eval/results/
 results_thinking_probe/
 log_*.txt
 
+# per-call input/output logs written by llm_client._log_call, one file per
+# <experiment>__<role>__<model> -- large, reproducible-from-a-rerun, and for a
+# real GPQA run these contain real question text end to end (not just the
+# fusion answer), so they must never be committed (see gitignore rule for
+# eval/data/* above for the same anti-leakage reason).
+call_logs/
+
 # python
 __pycache__/
 *.pyc
@@ -10,3 +17,10 @@ __pycache__/
 # local key files, if anyone drops one here by habit
 *.env
 .env
+
+# real GPQA data is a gated dataset whose own ToS forbids publishing examples
+# online (anti-leakage clause) -- only the made-up gpqa_sample.jsonl placeholder
+# is meant to be tracked here. Keep any real download outside this repo, or if
+# you drop it in eval/data/ anyway, this blocks it from ever being committed.
+eval/data/*
+!eval/data/gpqa_sample.jsonl

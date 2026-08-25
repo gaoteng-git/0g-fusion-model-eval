@@ -16,7 +16,14 @@ import string
 
 from mock_fusion_api.panel_config import FINAL_LETTER_INSTRUCTION
 
-SAMPLE_PATH = os.path.join(os.path.dirname(__file__), "data", "gpqa_sample.jsonl")
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # .../0g-fusion-model-eval
+SAMPLE_PATH = os.path.join(_REPO_ROOT, "eval", "data", "gpqa_sample.jsonl")
+
+# Real GPQA Diamond download (see download_gpqa_hf.py), expected one directory
+# above this repo -- deliberately outside the repo tree so it can never be
+# git-added by accident (see .gitignore's eval/data/* rule for the same reason).
+REAL_DEFAULT_PATH = os.path.join(os.path.dirname(_REPO_ROOT), "gpqa_diamond.jsonl")
+
 REQUIRED_COLUMNS = ("Question", "Correct Answer", "Incorrect Answer 1", "Incorrect Answer 2", "Incorrect Answer 3")
 
 
@@ -49,7 +56,14 @@ def _format_question(row, index):
 
 
 def load_tasks(path=None, limit=None):
-    path = path or SAMPLE_PATH
+    if path is None:
+        # Prefer the real downloaded dataset when it's present; otherwise fall
+        # back to the made-up sample so tests / a fresh clone still work with
+        # no setup. This means the default silently switches from placeholder
+        # to real questions the moment gpqa_diamond.jsonl shows up one
+        # directory above this repo -- worth knowing before assuming a run
+        # used the sample set.
+        path = REAL_DEFAULT_PATH if os.path.exists(REAL_DEFAULT_PATH) else SAMPLE_PATH
     rows = _read_rows(path)
     if limit:
         rows = rows[:limit]
