@@ -16,6 +16,7 @@ extract_thinking() below handles both.
 import json
 import os
 import re
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -60,8 +61,20 @@ def _log_call(experiment, role, model, request_body, response_message):
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+MAX_RETRIES = 3          # retry attempts AFTER the first try -- 4 attempts total on a persistent failure
+RETRY_SLEEP_SECONDS = 2  # fixed interval between attempts, not exponential -- simple and predictable
+
+
 def call_llm(model, messages, tools=None, json_mode=False, reasoning_effort=None, experiment=None, role=None):
-    """One single-shot chat completion. No retries, no loop, no tool execution.
+    """One single-shot chat completion (from the caller's perspective) -- no
+    agentic loop, no tool execution. Internally retries the real HTTP call up
+    to MAX_RETRIES times (RETRY_SLEEP_SECONDS apart) on ANY failure (HTTP
+    error or connection-level error) before giving up and raising.
+
+    Deliberately a blanket policy, not a smart one: it does not skip
+    retrying permanent errors like 400 model_not_capable, where the request
+    shape won't change between attempts and the 3 retries just burn ~6s
+    before failing anyway. Simple and predictable beats saving that 6s.
 
     `experiment`/`role` (e.g. role="panel"/"judge"/"synthesis"/"baseline") are
     optional and only used to name the call-log file -- they are never sent
@@ -84,34 +97,70 @@ def call_llm(model, messages, tools=None, json_mode=False, reasoning_effort=None
         _log_call(experiment, role, model, body, {"choices": [{"message": message}]})
         return message
 
-    req = urllib.request.Request(
-        UPSTREAM_BASE_URL.rstrip("/") + "/chat/completions",
-        data=json.dumps(body).encode(),
-        headers={
-            "Authorization": f"Bearer {UPSTREAM_API_KEY}",
-            "Content-Type": "application/json",
-            # Some models' upstream providers sit behind Cloudflare, which
-            # blocks urllib's default "Python-urllib/3.x" User-Agent as
-            # suspicious/bot traffic (Cloudflare error 1010 -- confirmed live
-            # against kimi-k3 through router-api.0g.ai). A normal browser UA
-            # is enough to get past that specific check.
-            "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            payload = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        # Same class of bug as eval/client.py's call_api had: a bare HTTPError
-        # discards the response body, which is exactly where the upstream's
-        # real reason lives (invalid key, wrong tier for this model, rate
-        # limit, unsupported model ID, ...). Surface it -- this is what a
-        # real run's panel/judge/synthesis failures need to be diagnosable
-        # from the caller's traceback instead of a bare "HTTP Error 403".
-        detail = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"{UPSTREAM_BASE_URL} returned HTTP {e.code} for model={model!r}: {detail}") from e
-    message = payload["choices"][0]["message"]
+    headers = {
+        "Authorization": f"Bearer {UPSTREAM_API_KEY}",
+        "Content-Type": "application/json",
+        # Some models' upstream providers sit behind Cloudflare, which
+        # blocks urllib's default "Python-urllib/3.x" User-Agent as
+        # suspicious/bot traffic (Cloudflare error 1010 -- confirmed live
+        # against kimi-k3 through router-api.0g.ai). A normal browser UA
+        # is enough to get past that specific check.
+        "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+    }
+    for attempt in range(1, MAX_RETRIES + 2):  # 1..(MAX_RETRIES+1) = up to 4 attempts total
+        req = urllib.request.Request(
+            UPSTREAM_BASE_URL.rstrip("/") + "/chat/completions",
+            data=json.dumps(body).encode(),
+            headers=headers,
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                raw_body = resp.read()
+            payload = json.loads(raw_body)
+            message = payload["choices"][0]["message"]
+            break
+        except urllib.error.HTTPError as e:
+            # A bare HTTPError discards the response body, which is exactly
+            # where the upstream's real reason lives (invalid key, wrong tier
+            # for this model, rate limit, unsupported model ID, ...). Surface
+            # it, or a failure is just a bare "HTTP Error 403".
+            detail = e.read().decode("utf-8", errors="replace")
+            err = RuntimeError(f"{UPSTREAM_BASE_URL} returned HTTP {e.code} for model={model!r}: {detail}")
+            err.__cause__ = e
+        except urllib.error.URLError as e:
+            # Connection-level failure (timeout, connection refused, DNS) --
+            # no HTTP response at all, so there's no body to read.
+            err = RuntimeError(f"{UPSTREAM_BASE_URL} request failed for model={model!r}: {e.reason}")
+            err.__cause__ = e
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            # HTTP 200 but the body isn't decodable JSON (truncated response,
+            # an HTML error page served with a 200 status, a binary/wrongly
+            # encoded body, ...). Both must be listed: json.loads() raises
+            # UnicodeDecodeError, NOT JSONDecodeError, on undecodable bytes,
+            # and neither is a subclass of the other -- an unlisted one would
+            # escape straight out of the retry loop, skipping both the retry
+            # and the clear-error-message wrapping.
+            err = RuntimeError(f"{UPSTREAM_BASE_URL} returned a non-JSON response for model={model!r}: {e}")
+            err.__cause__ = e
+        except (KeyError, IndexError, TypeError) as e:
+            # HTTP 200, valid JSON, but not shaped like a chat completion
+            # (e.g. a rate-limit/status object mistakenly served with 200).
+            # payload is always defined here (this can only fire after
+            # json.loads succeeded).
+            err = RuntimeError(
+                f"{UPSTREAM_BASE_URL} returned an unexpected response shape for model={model!r}: "
+                f"{e} -- payload={payload!r}"
+            )
+            err.__cause__ = e
+        if attempt > MAX_RETRIES:
+            raise err
+        print(
+            f"llm_client.call_llm_retry model={model!r} role={role!r} attempt={attempt}/{MAX_RETRIES + 1} "
+            f"error={str(err)!r} -- sleeping {RETRY_SLEEP_SECONDS}s before retrying",
+            file=sys.stderr,
+        )
+        time.sleep(RETRY_SLEEP_SECONDS)
     # Log the FULL raw response payload, not just the message we use --
     # usage (prompt/completion/reasoning token counts), finish_reason, id,
     # and the actually-served model (may differ from the requested one on a
@@ -129,12 +178,10 @@ def extract_thinking(message):
     inline <think>...</think> markup in `content` (MiniMax-M3). Returns
     (None, content) when neither is present (e.g. a model with thinking off).
 
-    Extracts ALL <think>...</think> blocks, not just the first -- an earlier
-    version used a single search() + "everything after the first </think>"
-    split, which silently dropped any text before the first <think> tag and
-    left a second think block (if the model ever emits more than one)
-    un-stripped inside the returned content. Both were real, demonstrated
-    failure modes, not hypothetical.
+    Uses findall/sub over EVERY <think> block rather than the more obvious
+    "split on the first </think>": that split silently drops any text
+    preceding the first <think> tag, and leaves a second block un-stripped
+    inside the returned content if a model emits more than one.
     """
     reasoning_content = message.get("reasoning_content")
     content = message.get("content") or ""

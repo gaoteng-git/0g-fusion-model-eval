@@ -26,14 +26,31 @@ python3 tests.py
 ```
 export ZG_UPSTREAM_BASE_URL=https://your-openai-compatible-provider/v1
 export ZG_UPSTREAM_API_KEY=sk-...
-export ZG_PANEL_MODELS=minimax-m3,kimi-k3,glm-5.2,deepseek-v4-pro,<5th-candidate>
+export ZG_PANEL_MODELS=minimax-m3,kimi-k3,glm-5.2,deepseek-v4-pro   # the 4 fixed members
 export ZG_JUDGE_MODEL=minimax-m3
 export ZG_SYNTHESIS_MODEL=kimi-k3
 
 python3 -m mock_fusion_api.server 8000 &
-python3 -m eval.run_eval --fusion-model 0g/fusion-preview --baseline-model gpt-5.6-sol
-python3 -m eval.gpqa_grade eval/results/run_<timestamp>.jsonl
+python3 -m eval.run_eval --fusion-model 0g/fusion-preview \
+    --baseline-model gpt-5.6-sol,claude-fable-5 --experiment gpqa-main
+python3 -m eval.gpqa_grade eval/results/gpqa-main.jsonl
 ```
+
+`--baseline-model` is a comma-separated list of 0+ models, all called for every
+question alongside fusion (pass `""` for fusion-only, no baselines). Output
+defaults to `eval/results/<experiment>.jsonl` — re-running the same
+`--experiment` (e.g. after a `--limit 5` smoke test, now without `--limit`)
+resumes into that file: already-succeeded questions are reused, not re-called.
+`--no-resume` overwrites from scratch instead. A smaller `--limit` on a later
+run only narrows what gets *called* — prior rows outside that window stay in
+the file rather than being deleted.
+
+Resume is per-question, not per-baseline: a reused row keeps whatever baseline
+entries it already has, so a baseline model that failed (or one added to
+`--baseline-model` afterwards) is not filled in by re-running `run_eval.py` —
+it says so on stderr and names the model. `eval/run_baseline.py` is what adds
+or retries one baseline on an already-completed run without re-paying for
+fusion; point its `--out` at the same file to accumulate in place.
 
 Without `ZG_UPSTREAM_BASE_URL` set, every LLM call returns a deterministic
 fake response (`FAKE` mode in `llm_client.py`) that reproduces the three
@@ -80,12 +97,16 @@ per-question panel breakdown — nothing extra needs capturing):
 ```
 python3 -m eval.run_eval --out eval/results/base.jsonl        # once, with the 4 fixed panel models
 python3 -m eval.run_variant --base-replay eval/results/base.jsonl \
-    --variant-model xiaomi/mimo-v2.5-pro --out eval/results/variant_mimo.jsonl
+    --variant-model xiaomi/mimo-v2.5-pro --out eval/results/variant_mimo.jsonl --fixed-count 4
 python3 -m eval.gpqa_grade eval/results/variant_mimo.jsonl
 ```
 Each variant run only pays for 1 panel call + judge + synthesis, not all 5
-panel calls again. The baseline side isn't re-called either — it's carried
-over unchanged from the base replay row.
+panel calls again. The baselines list isn't re-called either — it's carried
+over unchanged from the base replay row. `--fixed-count` (default 4) aborts
+the run immediately, before any calls, if the base run's panel doesn't have
+that many members — guards against the base run having been accidentally
+configured with a candidate already baked in, which would otherwise make
+variant runs silently accumulate panel members instead of doing a clean swap.
 
 ## Per-call logging
 
