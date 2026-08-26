@@ -31,26 +31,73 @@ export ZG_JUDGE_MODEL=minimax-m3
 export ZG_SYNTHESIS_MODEL=kimi-k3
 
 python3 -m mock_fusion_api.server 8000 &
-python3 -m eval.run_eval --fusion-model 0g/fusion-preview \
-    --baseline-model gpt-5.6-sol,claude-fable-5 --experiment gpqa-main
-python3 -m eval.gpqa_grade eval/results/gpqa-main.jsonl
+
+# NOTE: `eval.panel`/`eval.fuse` below always pass the panel explicitly via
+# `cached_panel`/`extra_panel_models`, so once they're in use ZG_PANEL_MODELS
+# above is never actually consulted (it still matters for a bare
+# `{"model": "0g/fusion*"}` request, and for tests.py) -- a typo in one of
+# these commands' own `--models` gets no protection from it.
+
+# 1. Build the panel. No judge/synthesis call happens here -- this step only
+#    ever costs the panel models themselves.
+python3 -m eval.panel --fusion-url http://localhost:8000 \
+    --models minimax-m3,kimi-k3,glm-5.2,deepseek-v4-pro --experiment gpqa-panel-fixed4
+
+# 2. Fuse it into a real judge+synthesis result whenever you're ready to pay for one.
+python3 -m eval.fuse --fusion-url http://localhost:8000 \
+    --panel eval/results/gpqa-panel-fixed4.jsonl --experiment gpqa-fuse-fixed4
+
+# 3. Baselines are completely independent -- no panel/fusion file needed at all.
+python3 -m eval.baseline --baseline-url http://localhost:8000 \
+    --models gpt-5.6-sol,claude-fable-5 --experiment gpqa-baselines
+
+# 4. Grade fusion + baselines together -- they're two separate files on disk.
+python3 -m eval.grade eval/results/gpqa-fuse-fixed4.jsonl eval/results/gpqa-baselines.jsonl
 ```
 
-`--baseline-model` is a comma-separated list of 0+ models, all called for every
-question alongside fusion (pass `""` for fusion-only, no baselines). Output
-defaults to `eval/results/<experiment>.jsonl` — re-running the same
-`--experiment` (e.g. after a `--limit 5` smoke test, now without `--limit`)
-resumes into that file: already-succeeded questions are reused, not re-called.
-`--no-resume` overwrites from scratch instead. A smaller `--limit` on a later
-run only narrows what gets *called* — prior rows outside that window stay in
-the file rather than being deleted.
+Four small, single-purpose tools instead of one monolith, composed like Unix
+pipeline stages -- each reads/writes a plain JSONL keyed by `question_id`,
+nothing hidden between them:
 
-Resume is per-question, not per-baseline: a reused row keeps whatever baseline
-entries it already has, so a baseline model that failed (or one added to
-`--baseline-model` afterwards) is not filled in by re-running `run_eval.py` —
-it says so on stderr and names the model. `eval/run_baseline.py` is what adds
-or retries one baseline on an already-completed run without re-paying for
-fusion; point its `--out` at the same file to accumulate in place.
+- **`eval.panel`** computes panel-member answers only, nothing else. `--models`
+  is always the FULL desired panel for that file, never "add one more to
+  whatever's already there" -- a panel is stated completely, every time, so
+  there's nothing to accidentally accumulate. `--reuse <file>` pulls
+  already-computed answers from a DIFFERENT file for models present there, so
+  extending or swapping a panel only calls what's actually new (see below).
+  `--reuse` must point at a real file — a typo'd path is refused, not
+  silently treated as empty (which would re-call every model at full price).
+- **`eval.fuse`** runs judge+synthesis over an already-built panel file --
+  the *only* step that costs judge+synthesis money, kept deliberately
+  separate so a panel can be built, inspected, and reused as many times as
+  you like before paying for a real result against it.
+- **`eval.baseline`** computes 1+ baseline models directly against the
+  question set, with no dependency on any panel/fusion file. Repeated calls
+  targeting the same `--out` accumulate (add a 2nd baseline, retry a failed
+  one) rather than replace.
+- **`eval.grade`** takes 1+ files and merges them by `question_id` before
+  scoring -- a fuse file and a baseline file never need to be combined into
+  one file on disk to be graded together. Refuses to merge two files that
+  disagree about what a shared `question_id` actually is (different
+  `instruction`/`correct_letter`) — that can only mean the files came from
+  different question sets, and grading them together would silently depend
+  on which file was passed first.
+
+All four default `--out` to `eval/results/<experiment>.jsonl` and resume into
+it: re-running the same `--experiment`/`--out` reuses whatever's already
+there and only calls for what's missing or previously failed. The reusable
+unit differs per tool, on purpose: `eval.fuse` resumes per *row* (one row is
+one atomic fusion answer — nothing smaller to reuse); `eval.panel` and
+`eval.baseline` both resume per *model* within a row (`--models
+a,b,c` after a row already has `a` only calls `b` and `c`; a `--baseline`
+model that failed is retried without disturbing the others in the same row).
+`--no-resume` discards and starts over. A smaller `--limit` on a later run
+only narrows what gets *called* — prior rows outside that window stay in the
+file rather than being deleted. Pointing `--out` at a file a *different* one
+of these four tools wrote is refused, not silently accepted and rewritten —
+each tool only ever adds/replaces its own fields, so treating someone else's
+file as "already done" would otherwise drop whatever it already had (and
+already cost real money to produce).
 
 Without `ZG_UPSTREAM_BASE_URL` set, every LLM call returns a deterministic
 fake response (`FAKE` mode in `llm_client.py`) that reproduces the three
@@ -78,8 +125,29 @@ are sent).
 ## Reusing fixed panel members across variant runs
 
 If you're testing several candidate 5th panel members against the same 4
-fixed ones (e.g. 3 MiMo-candidate variants), don't re-pay for the 4 unchanged
-panel calls each time. `run_fusion` accepts two extra request fields:
+fixed ones (e.g. 3 MiMo-candidate variants), `eval.panel --reuse` avoids
+re-paying for the 4 unchanged panel calls each time — and, just as
+importantly, avoids paying for judge+synthesis at all while doing it, since
+`eval.panel` never runs them in the first place:
+
+```
+# once: the 4 fixed panel members
+python3 -m eval.panel --fusion-url http://localhost:8000 \
+    --models minimax-m3,kimi-k3,glm-5.2,deepseek-v4-pro --experiment gpqa-panel-fixed4
+
+# one variant per candidate: reuse the 4 fixed ones, call only the new model
+python3 -m eval.panel --fusion-url http://localhost:8000 \
+    --models minimax-m3,kimi-k3,glm-5.2,deepseek-v4-pro,hy3 \
+    --reuse eval/results/gpqa-panel-fixed4.jsonl --experiment gpqa-panel-hy3
+
+# pay for judge+synthesis only once you actually want a scored result
+python3 -m eval.fuse --fusion-url http://localhost:8000 \
+    --panel eval/results/gpqa-panel-hy3.jsonl --experiment gpqa-fuse-hy3
+python3 -m eval.grade eval/results/gpqa-fuse-hy3.jsonl eval/results/gpqa-baselines.jsonl
+```
+
+Under the hood this is the same two request fields as before, now issued by
+`eval.panel` on the caller's behalf:
 
 - `cached_panel`: a list of already-computed panel entries (the shape
   `run_panel` produces: `model`/`content`/`reasoning`/`tool_calls`), used
@@ -87,26 +155,12 @@ panel calls each time. `run_fusion` accepts two extra request fields:
 - `extra_panel_models`: model IDs actually called fresh this round.
 
 When either is present, `cfg.PANEL_MODELS` is ignored entirely — the caller
-fully controls the panel composition for that call. Judge + synthesis then
-run once, over the merged (cached + fresh) panel, same as always.
-
-`eval/run_variant.py` drives this from a prior `run_eval.py` replay file
-(whose `fusion.raw_response["0g_fusion"]["panel"]` already holds the full
-per-question panel breakdown — nothing extra needs capturing):
-
-```
-python3 -m eval.run_eval --out eval/results/base.jsonl        # once, with the 4 fixed panel models
-python3 -m eval.run_variant --base-replay eval/results/base.jsonl \
-    --variant-model xiaomi/mimo-v2.5-pro --out eval/results/variant_mimo.jsonl --fixed-count 4
-python3 -m eval.gpqa_grade eval/results/variant_mimo.jsonl
-```
-Each variant run only pays for 1 panel call + judge + synthesis, not all 5
-panel calls again. The baselines list isn't re-called either — it's carried
-over unchanged from the base replay row. `--fixed-count` (default 4) aborts
-the run immediately, before any calls, if the base run's panel doesn't have
-that many members — guards against the base run having been accidentally
-configured with a candidate already baked in, which would otherwise make
-variant runs silently accumulate panel members instead of doing a clean swap.
+fully controls the panel composition for that call. A third field,
+`panel_only`, makes `run_fusion` stop right after the panel instead of
+continuing into judge+synthesis — the eval-only mechanism `eval.panel` relies
+on to build/extend a panel for free (see `pipeline.run_fusion`'s docstring;
+no real product caller ever sets it). `eval.fuse` is what runs judge+synthesis
+over the merged (cached + fresh) panel once you actually want a scored result.
 
 ## Per-call logging
 
@@ -115,7 +169,8 @@ the entire request body and the entire raw response payload (not just the
 message: `usage`, `finish_reason`, `id`, the actually-served model too) — to
 `call_logs/<experiment>__<role>__<model>.jsonl`, one JSON line appended per
 call. Logging only fires when the caller passes an `experiment` name
-(`run_eval.py`/`run_variant.py`'s `--experiment`, defaulted if not given);
-calls with no experiment name (tests, ad-hoc pokes) write nothing.
+(`eval.panel`/`eval.fuse`/`eval.baseline`'s `--experiment`, defaulted from
+the command's own arguments if not given); calls with no experiment name
+(tests, ad-hoc pokes) write nothing.
 `call_logs/` is gitignored — for a real run these files contain real GPQA
 question text end to end, same anti-leakage handling as `eval/data/*`.

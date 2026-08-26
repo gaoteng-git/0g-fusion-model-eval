@@ -34,7 +34,8 @@ _THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 #   <LOG_DIR>/<experiment>__<role>__<model>.jsonl   (one JSON line appended per call)
 # so a full run can be replayed/audited call-by-call after the fact, not just
 # from the final replay row. Only fires when the caller passes an `experiment`
-# name (run_eval.py does) -- ad-hoc/offline/test calls that don't pass one
+# name (eval.panel/eval.fuse/eval.baseline do) -- ad-hoc/offline/test calls
+# that don't pass one
 # produce no log files, so `python3 tests.py` and dev pokes stay log-free.
 LOG_DIR = os.environ.get("ZG_CALL_LOG_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "call_logs"))
 _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")

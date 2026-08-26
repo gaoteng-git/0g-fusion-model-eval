@@ -1,4 +1,4 @@
-"""Replay-file plumbing shared by run_eval.py / run_variant.py / run_baseline.py.
+"""Replay-file plumbing shared by eval/panel.py, eval/fuse.py, eval/baseline.py.
 
 All three write the same kind of file (one JSON row per question, keyed by
 question_id) and all three resume into it the same way, so the naming, the
@@ -36,7 +36,7 @@ class ResumeMismatchError(Exception):
     failure: it always aborts the whole run."""
 
 
-def load_existing(out_path, expected):
+def load_existing(out_path, expected, expected_schema=None):
     """question_id -> row, for whatever's already at out_path (empty if the
     file doesn't exist yet -- a brand-new experiment name).
 
@@ -49,7 +49,14 @@ def load_existing(out_path, expected):
     from different questions. Either way, resuming across that switch would
     reuse rows answering question A while grading them against question B's
     correct_letter -- silently wrong accuracy, no crash. Refuse instead.
-    Called before --out is opened for writing, so aborting leaves it intact."""
+    Called before --out is opened for writing, so aborting leaves it intact.
+
+    `expected_schema`, if given, is checked against each row's own `schema`
+    field: pointing --out (or eval/panel.py's --reuse) at a file written by a
+    DIFFERENT tool -- e.g. `eval.baseline --out` aimed at an `eval.fuse`
+    result by mistake -- must not be silently treated as "already have it".
+    Every writer here rebuilds its row from scratch, so that would silently
+    drop whatever the other tool had already paid for."""
     if not out_path or not os.path.exists(out_path):
         return {}
     existing = {}
@@ -74,6 +81,14 @@ def load_existing(out_path, expected):
                 f"(correct_letter={row.get('correct_letter')!r}); now: {expected[qid][0][:80]!r} "
                 f"(correct_letter={expected[qid][1]!r}). Use a new --experiment name, or "
                 f"--no-resume to discard the old rows and recompute."
+            )
+        if expected_schema and row.get("schema") and row["schema"] != expected_schema:
+            raise ResumeMismatchError(
+                f"{out_path!r} already has a row for question_id={qid!r} written by a DIFFERENT tool "
+                f"(schema={row['schema']!r}, this tool writes {expected_schema!r}) -- probably the "
+                f"wrong --out/--reuse path. Reusing it would silently drop whatever that other tool's "
+                f"row already had (fusion/panel/baselines...), which likely already cost real money. "
+                f"Point --out at the right file, or --no-resume if you really mean to overwrite it."
             )
     return existing
 

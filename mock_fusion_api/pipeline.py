@@ -23,14 +23,15 @@ abort the run.
 Cost-saving reuse: a request may pass `cached_panel` (already-computed panel
 entries) plus `extra_panel_models` (model IDs to actually call fresh) instead
 of `model: "0g/fusion*"` triggering a full fresh panel -- see run_fusion's
-docstring and eval/run_variant.py, which uses this to re-run judge+synthesis
-against a swapped-in 5th panel member without re-paying for the 4 unchanged
-ones.
+docstring and eval/panel.py, which uses this (plus `panel_only` below) to
+build/extend a panel file without ever paying for judge+synthesis, and
+eval/fuse.py, which runs judge+synthesis against such a file with 0 fresh
+panel calls.
 
 Call logging: every call_llm() invocation here is tagged with a `role`
 ("panel"/"judge"/"synthesis" for the fusion path, "baseline" for the plain
 passthrough path) and forwards request["experiment"] (set by the eval
-harness, e.g. run_eval.py's --experiment) straight through. llm_client writes
+harness, e.g. eval.panel's --experiment) straight through. llm_client writes
 the full request+response of each call to
 call_logs/<experiment>__<role>__<model>.jsonl -- see llm_client.py's
 _log_call. No experiment name -> no log files (keeps tests/dev calls quiet).
@@ -150,7 +151,7 @@ def run_judge(messages, panel_results, experiment=None, question_id=None):
     returns the raw text and lets the pipeline continue into synthesis
     unchanged -- a malformed judge JSON degrades that one question's evidence
     quality, it must not abort the run. question_id (set by the eval harness,
-    e.g. run_eval.py's task["question_id"]) is only used for this message; a
+    e.g. eval.panel's task["question_id"]) is only used for this message; a
     caller that never sets it (e.g. debug_fusion_call.py) just gets `None` in
     the log line instead of a real id."""
     evidence = panel_evidence(panel_results).split("Panel answers:\n", 1)[-1]
@@ -209,11 +210,11 @@ def run_fusion(request):
     list of already-computed panel entries (same shape run_panel produces:
     model/content/reasoning/tool_calls) that are used as-is, no LLM call
     made for them; `extra_panel_models` are model IDs actually called fresh
-    this round. This is what lets a caller re-run judge+synthesis against a
-    swapped-in panel member without re-paying for the other, unchanged
-    panel members -- see eval/run_variant.py, which drives this by reading
-    a prior run's replay file (fusion.raw_response.0g_fusion.panel) as the
-    cached_panel for later variant runs."""
+    this round. Passing ALL desired members as `cached_panel` with no
+    `extra_panel_models` makes 0 panel calls -- see eval/fuse.py, which runs
+    judge+synthesis against an already-built eval/panel.py file this way.
+    `panel_only` (below) stops before judge+synthesis entirely -- that's
+    what eval/panel.py itself uses to build/extend a panel file for free."""
     messages = request["messages"]
     tools = request.get("tools")
     allow = bool(request.get("allow_tool_call_output", False))
@@ -229,6 +230,14 @@ def run_fusion(request):
         panel_results = cached_panel + fresh
     else:
         panel_results = run_panel(messages, tools, allow, experiment=experiment)
+
+    if request.get("panel_only"):
+        # Eval-only cost-saving extension, not a real product feature: stop
+        # right after the panel, paying nothing for judge+synthesis. A real
+        # caller always wants a final answer, so this never fires outside
+        # the eval harness -- see eval/panel.py, which is the only caller.
+        return {"0g_fusion": {"panel": panel_results}}
+
     judge_json = run_judge(messages, panel_results, experiment=experiment, question_id=question_id)
     final = run_synthesis(messages, panel_results, judge_json, tools, allow, experiment=experiment)
     tool_calls = final.get("tool_calls")
