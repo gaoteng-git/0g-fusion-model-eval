@@ -97,15 +97,19 @@ def carry_over_unprocessed(f, existing, expected):
     """Copy prior rows for questions OUTSIDE this run's window into the
     freshly rewritten --out, and return how many.
 
-    Callers only invoke this when --limit is set. Every run truncates --out
-    and rewrites it, so without this, re-running a `--limit 5` smoke test
-    against an --out that already holds a finished 198-question run would
-    delete the other 193 -- rows that cost real API spend. --limit scopes what
-    this run *calls*, not what the file is allowed to keep. (--no-resume is the
-    way to genuinely shrink a file: it starts from no prior rows at all, so
-    there is nothing here to carry.) Without --limit, `expected` already covers
-    the whole dataset / base file, so anything else in --out is stale rather
-    than something worth preserving.
+    Every run truncates --out and rewrites it, so without this, re-running a
+    `--limit 5` smoke test against an --out that already holds a finished
+    198-question run would delete the other 193 -- rows that cost real API
+    spend. `expected` defines the window; whatever's outside it is preserved.
+    (--no-resume is the way to genuinely shrink a file: it starts from no
+    prior rows at all, so there is nothing here to carry.)
+
+    eval.panel/eval.baseline only call this when --limit is set, since
+    otherwise `expected` already covers the whole dataset and there is
+    nothing outside it. eval.fuse calls it unconditionally: its `expected` is
+    whatever --panel currently contains, which can shrink for reasons that
+    have nothing to do with --limit (an interrupted eval.panel run, a
+    hand-edited/concatenated panel file).
 
     Written in the prior file's own order, after the rows this run handled,
     which for --limit's leading window keeps question_id order."""

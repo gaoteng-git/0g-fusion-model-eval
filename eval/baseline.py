@@ -22,6 +22,11 @@ from .replay_io import (ResumeMismatchError, carry_over_unprocessed, default_out
 SCHEMA = "0g.fusion_eval.gpqa.baselines.v1"
 
 
+def _base_row(qid, task):
+    return {"schema": SCHEMA, "question_id": qid, "instruction": task["instruction"],
+            "correct_letter": task["correct_letter"]}
+
+
 def run(baseline_url, models, out_path, limit=None, experiment=None, resume=True):
     ensure_out_dir(out_path)
     tasks = load_tasks(limit=limit)
@@ -32,9 +37,7 @@ def run(baseline_url, models, out_path, limit=None, experiment=None, resume=True
     with open(out_path, "w", encoding="utf-8") as f:
         for task in tasks:
             qid = task["question_id"]
-            prior = existing.get(qid) or {"schema": SCHEMA, "question_id": qid,
-                                           "instruction": task["instruction"],
-                                           "correct_letter": task["correct_letter"], "baselines": []}
+            prior = existing.get(qid) or {**_base_row(qid, task), "baselines": []}
             prior_baselines = prior.get("baselines") or []
             have = {b["model"] for b in prior_baselines if not b.get("failed")}
             need = [m for m in models if m not in have]
@@ -65,13 +68,7 @@ def run(baseline_url, models, out_path, limit=None, experiment=None, resume=True
                           file=sys.stderr)
                     new_entries.append({"model": bm, "failed": True, "error": str(e)})
 
-            row = {
-                "schema": SCHEMA,
-                "question_id": qid,
-                "instruction": task["instruction"],
-                "correct_letter": task["correct_letter"],
-                "baselines": keep + new_entries,
-            }
+            row = {**_base_row(qid, task), "baselines": keep + new_entries}
             f.write(json.dumps(row) + "\n")
         if limit:
             skipped += carry_over_unprocessed(f, existing, expected)

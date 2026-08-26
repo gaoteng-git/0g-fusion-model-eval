@@ -19,6 +19,11 @@ from .replay_io import (ResumeMismatchError, carry_over_unprocessed, default_out
 SCHEMA = "0g.fusion_eval.gpqa.replay.v1"
 
 
+def _base_row(qid, panel_row):
+    return {"schema": SCHEMA, "question_id": qid, "instruction": panel_row.get("instruction"),
+            "correct_letter": panel_row.get("correct_letter")}
+
+
 def run(fusion_url, fusion_model, panel_path, out_path, limit=None, experiment=None, resume=True):
     with open(panel_path, encoding="utf-8") as f:
         panel_rows = [json.loads(line) for line in f if line.strip()]
@@ -53,14 +58,8 @@ def run(fusion_url, fusion_model, panel_path, out_path, limit=None, experiment=N
                 failed += 1
                 print(f"eval.fuse_question_skipped question_id={qid!r} reason='no panel available'",
                       file=sys.stderr)
-                out_f.write(json.dumps({
-                    "schema": SCHEMA,
-                    "question_id": qid,
-                    "instruction": panel_row.get("instruction"),
-                    "correct_letter": panel_row.get("correct_letter"),
-                    "failed": True,
-                    "error": panel_row.get("error", "no panel available"),
-                }) + "\n")
+                out_f.write(json.dumps({**_base_row(qid, panel_row), "failed": True,
+                                         "error": panel_row.get("error", "no panel available")}) + "\n")
                 continue
 
             # The call AND the row construction (including reading instruction/
@@ -74,10 +73,7 @@ def run(fusion_url, fusion_model, panel_path, out_path, limit=None, experiment=N
                 fusion_resp = call_api(fusion_url, fusion_model, messages, cached_panel=panel_row["panel"],
                                         experiment=experiment, question_id=qid)
                 row = {
-                    "schema": SCHEMA,
-                    "question_id": qid,
-                    "instruction": panel_row["instruction"],
-                    "correct_letter": panel_row["correct_letter"],
+                    **_base_row(qid, panel_row),
                     "panel": panel_row["panel"],
                     "fusion": {
                         "model": fusion_model,
@@ -90,15 +86,7 @@ def run(fusion_url, fusion_model, panel_path, out_path, limit=None, experiment=N
             except Exception as e:
                 failed += 1
                 print(f"eval.fuse_question_failed question_id={qid!r} error={str(e)!r}", file=sys.stderr)
-                row = {
-                    "schema": SCHEMA,
-                    "question_id": qid,
-                    "instruction": panel_row.get("instruction"),
-                    "correct_letter": panel_row.get("correct_letter"),
-                    "panel": panel_row.get("panel"),
-                    "failed": True,
-                    "error": str(e),
-                }
+                row = {**_base_row(qid, panel_row), "panel": panel_row.get("panel"), "failed": True, "error": str(e)}
             out_f.write(json.dumps(row) + "\n")
         # Unlike eval.panel/eval.baseline (whose `expected` is load_tasks()'s
         # full dataset when --limit is unset), `expected` here is only

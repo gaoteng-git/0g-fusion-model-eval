@@ -44,6 +44,11 @@ def _panel_by_model(row):
     return {p["model"]: p for p in (row.get("panel") or []) if not p.get("failed")}
 
 
+def _base_row(qid, task):
+    return {"schema": SCHEMA, "question_id": qid, "instruction": task["instruction"],
+            "correct_letter": task["correct_letter"]}
+
+
 def run(fusion_url, fusion_model, models, out_path, limit=None, experiment=None, resume=True, reuse_path=None):
     ensure_out_dir(out_path)
     if reuse_path and not os.path.exists(reuse_path):
@@ -86,13 +91,7 @@ def run(fusion_url, fusion_model, models, out_path, limit=None, experiment=None,
                 # rather than making a call whose only job is to hand back
                 # data we already have.
                 skipped += 1
-                f.write(json.dumps({
-                    "schema": SCHEMA,
-                    "question_id": qid,
-                    "instruction": task["instruction"],
-                    "correct_letter": task["correct_letter"],
-                    "panel": cached,
-                }) + "\n")
+                f.write(json.dumps({**_base_row(qid, task), "panel": cached}) + "\n")
                 continue
 
             messages = [{"role": "user", "content": task["instruction"]}]
@@ -104,29 +103,15 @@ def run(fusion_url, fusion_model, models, out_path, limit=None, experiment=None,
                 resp = call_api(fusion_url, fusion_model, messages, panel_only=True,
                                  cached_panel=cached, extra_panel_models=fresh_models,
                                  experiment=experiment, question_id=qid)
-                row = {
-                    "schema": SCHEMA,
-                    "question_id": qid,
-                    "instruction": task["instruction"],
-                    "correct_letter": task["correct_letter"],
-                    "panel": resp["0g_fusion"]["panel"],
-                }
+                row = {**_base_row(qid, task), "panel": resp["0g_fusion"]["panel"]}
             except Exception as e:
                 failed += 1
                 print(f"eval.panel_question_failed question_id={qid!r} error={str(e)!r}", file=sys.stderr)
-                row = {
-                    "schema": SCHEMA,
-                    "question_id": qid,
-                    "instruction": task["instruction"],
-                    "correct_letter": task["correct_letter"],
-                    # `cached` (whatever was already sitting in --out/--reuse
-                    # before this call) survives even though the fresh call
-                    # for the rest failed -- a retry can still reuse it
-                    # instead of re-paying for models that already succeeded.
-                    "panel": cached,
-                    "failed": True,
-                    "error": str(e),
-                }
+                # `cached` (whatever was already sitting in --out/--reuse
+                # before this call) survives even though the fresh call for
+                # the rest failed -- a retry can still reuse it instead of
+                # re-paying for models that already succeeded.
+                row = {**_base_row(qid, task), "panel": cached, "failed": True, "error": str(e)}
             f.write(json.dumps(row) + "\n")
         if limit:
             skipped += carry_over_unprocessed(f, existing, expected)

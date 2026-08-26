@@ -109,7 +109,7 @@ def load_rows(paths):
                             f"These files were not built from the same question set; don't grade them "
                             f"together."
                         )
-                merged[qid] = {**merged.get(qid, {}), **row}
+                merged[qid] = {**(prior or {}), **row}
     return list(merged.values())
 
 
