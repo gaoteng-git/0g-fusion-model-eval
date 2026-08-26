@@ -13,7 +13,7 @@ import json
 import sys
 
 from .client import call_api
-from .replay_io import ResumeMismatchError, carry_over_unprocessed, default_out_path, ensure_out_dir, load_existing
+from .replay_io import ResumeMismatchError, add_out_args, default_out_path, ensure_out_dir, load_existing, run_replay
 
 SCHEMA = "0g.fusion_eval.gpqa.replay.v1"
 
@@ -69,57 +69,44 @@ def run(fusion_url, fusion_model, panel_path, out_path, limit=None, experiment=N
             )
     ensure_out_dir(out_path)
 
-    skipped = failed = 0
-    with open(out_path, "w", encoding="utf-8") as out_f:
-        for panel_row in panel_rows:
-            qid = panel_row.get("question_id")
-            prior = existing.get(qid)
-            if prior is not None and not prior.get("failed"):
-                skipped += 1
-                out_f.write(json.dumps(prior) + "\n")
-                continue
+    def process(panel_row, prior):
+        qid = panel_row.get("question_id")
+        if prior is not None and not prior.get("failed"):
+            return prior, {"skipped": 1}
 
-            if panel_row.get("failed") or not panel_row.get("panel"):
-                failed += 1
-                print(f"eval.fuse_question_skipped question_id={qid!r} reason='no panel available'",
-                      file=sys.stderr)
-                out_f.write(json.dumps({**_base_row(qid, panel_row), "failed": True,
-                                         "error": panel_row.get("error", "no panel available")}) + "\n")
-                continue
+        if panel_row.get("failed") or not panel_row.get("panel"):
+            print(f"eval.fuse_question_skipped question_id={qid!r} reason='no panel available'", file=sys.stderr)
+            return ({**_base_row(qid, panel_row), "failed": True,
+                     "error": panel_row.get("error", "no panel available")}, {"failed": 1})
 
-            # The call AND the row construction (including reading instruction/
-            # correct_letter/panel back out of panel_row) must all stay inside
-            # this one try block: any of those is itself a failure point on a
-            # malformed panel row, and the except branch below only uses
-            # .get() so it can't ALSO raise while building the failure row.
-            try:
-                messages = [{"role": "user", "content": panel_row["instruction"]}]
-                fusion_resp = call_api(fusion_url, fusion_model, messages, cached_panel=panel_row["panel"],
-                                        experiment=experiment, question_id=qid)
-                row = {
-                    **_base_row(qid, panel_row),
-                    "panel": panel_row["panel"],
-                    "fusion": {
-                        "model": fusion_model,
-                        "content": fusion_resp["choices"][0]["message"]["content"],
-                        "reasoning_content": fusion_resp["choices"][0]["message"].get("reasoning_content"),
-                        "raw_response": fusion_resp,
-                    },
-                    "config_id": _config_id(fusion_model, panel_row),
-                }
-            except Exception as e:
-                failed += 1
-                print(f"eval.fuse_question_failed question_id={qid!r} error={str(e)!r}", file=sys.stderr)
-                row = {**_base_row(qid, panel_row), "panel": panel_row.get("panel"), "failed": True, "error": str(e)}
-            out_f.write(json.dumps(row) + "\n")
-        # `expected` here is whatever --panel currently contains, which can
-        # be SMALLER than a prior run's for reasons that have nothing to do
-        # with THIS run's --limit (an interrupted eval.panel run, a hand-
-        # edited/concatenated panel file, an earlier --no-resume --limit).
-        # Always carry forward rows outside that window, or a shrunk --panel
-        # silently deletes already-paid judge+synthesis results instead of
-        # just leaving them untouched.
-        carried = carry_over_unprocessed(out_f, existing, expected)
+        # The call AND the row construction (including reading instruction/
+        # correct_letter/panel back out of panel_row) must all stay inside
+        # this one try block: any of those is itself a failure point on a
+        # malformed panel row, and the except branch below only uses .get()
+        # so it can't ALSO raise while building the failure row.
+        try:
+            messages = [{"role": "user", "content": panel_row["instruction"]}]
+            fusion_resp = call_api(fusion_url, fusion_model, messages, cached_panel=panel_row["panel"],
+                                    experiment=experiment, question_id=qid)
+            row = {
+                **_base_row(qid, panel_row),
+                "panel": panel_row["panel"],
+                "fusion": {
+                    "model": fusion_model,
+                    "content": fusion_resp["choices"][0]["message"]["content"],
+                    "reasoning_content": fusion_resp["choices"][0]["message"].get("reasoning_content"),
+                    "raw_response": fusion_resp,
+                },
+                "config_id": _config_id(fusion_model, panel_row),
+            }
+            return row, {}
+        except Exception as e:
+            print(f"eval.fuse_question_failed question_id={qid!r} error={str(e)!r}", file=sys.stderr)
+            row = {**_base_row(qid, panel_row), "panel": panel_row.get("panel"), "failed": True, "error": str(e)}
+            return row, {"failed": 1}
+
+    counts = run_replay(panel_rows, lambda r: r.get("question_id"), process, out_path, existing, expected)
+    skipped, carried, failed = counts.get("skipped", 0), counts.get("carried", 0), counts.get("failed", 0)
     if skipped:
         print(f"eval.fuse_resumed skipped={skipped} (already had a successful result at {out_path!r})",
               file=sys.stderr)
@@ -136,10 +123,8 @@ if __name__ == "__main__":
     p.add_argument("--fusion-url", default="http://localhost:8000")
     p.add_argument("--fusion-model", default="0g/fusion-preview")
     p.add_argument("--panel", required=True, help="A panel file from eval.panel.")
-    p.add_argument("--out", default=None, help="Defaults to results/<experiment>.jsonl.")
-    p.add_argument("--limit", type=int, default=None)
+    add_out_args(p)
     p.add_argument("--experiment", default=None, help="Defaults to fuse-on-<panel filename>.")
-    p.add_argument("--no-resume", action="store_true", help="Ignore any existing rows at --out.")
     args = p.parse_args()
     experiment = args.experiment or f"fuse-on-{args.panel.rsplit('/', 1)[-1].removesuffix('.jsonl')}"
     out = args.out or default_out_path(experiment)

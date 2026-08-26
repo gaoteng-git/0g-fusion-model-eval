@@ -1,16 +1,35 @@
 """Replay-file plumbing shared by eval/panel.py, eval/fuse.py, eval/baseline.py.
 
 All three write the same kind of file (one JSON row per question, keyed by
-question_id) and all three resume into it the same way, so the naming, the
-directory creation and the resume-safety check live here once instead of
-three times. Everything task-specific -- what a row contains, what gets
-called, what counts as a failure -- stays in each script.
+question_id), resume into it the same way, and share most of their CLI
+shape -- so all of that lives here once. Everything task-specific -- what a
+row contains, what gets called, what counts as a failure -- stays in each
+script, behind run_replay()'s `process` callback.
 """
 import json
 import os
 import re
+import sys
 
 _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def parse_models(raw):
+    """Comma-separated --models -> deduped, order-preserving, non-empty list.
+    A repeated name must cost one call, not two; an empty list must fail
+    loud, not silently "succeed" at doing nothing."""
+    models = list(dict.fromkeys(m.strip() for m in raw.split(",") if m.strip()))
+    if not models:
+        sys.exit("--models must name at least one model")
+    return models
+
+
+def add_out_args(p):
+    """--out/--limit/--no-resume, identical in all three writers' argparse
+    setup. --models/--experiment/--*-url stay in each script -- tool-specific."""
+    p.add_argument("--out", default=None, help="Defaults to results/<experiment>.jsonl.")
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--no-resume", action="store_true", help="Ignore any existing rows at --out.")
 
 
 def default_out_path(experiment):
@@ -104,12 +123,12 @@ def carry_over_unprocessed(f, existing, expected):
     (--no-resume is the way to genuinely shrink a file: it starts from no
     prior rows at all, so there is nothing here to carry.)
 
-    eval.panel/eval.baseline only call this when --limit is set, since
-    otherwise `expected` already covers the whole dataset and there is
-    nothing outside it. eval.fuse calls it unconditionally: its `expected` is
-    whatever --panel currently contains, which can shrink for reasons that
-    have nothing to do with --limit (an interrupted eval.panel run, a
-    hand-edited/concatenated panel file).
+    Called unconditionally by run_replay() below, regardless of --limit:
+    `expected` can shrink for reasons that have nothing to do with THIS run's
+    own --limit (the underlying dataset or --panel file shrinking instead).
+    Gating this on --limit alone missed that and silently deleted
+    already-paid rows -- calling it from the one shared place instead of
+    copy-pasted into each writer is what keeps that fixed.
 
     Written in the prior file's own order, after the rows this run handled,
     which for --limit's leading window keeps question_id order."""
@@ -119,3 +138,30 @@ def carry_over_unprocessed(f, existing, expected):
             f.write(json.dumps(row) + "\n")
             carried += 1
     return carried
+
+
+def run_replay(items, get_qid, process, out_path, existing, expected):
+    """The write-loop shared by all three writers: open --out, write one row
+    per item, carry forward whatever's outside `expected`, return counts.
+
+    `process(item, prior)` -- prior = existing.get(get_qid(item)) -- owns
+    everything task-specific (skip/call/fail, build the row, log it) and
+    returns `(row, deltas)`; `deltas` is e.g. `{"skipped": 1}` or
+    `{"failed": 2}` (a count, not just a label -- one baseline row can fail
+    more than one of its N models) added into the running totals, or `{}`
+    for the ordinary case."""
+    counts = {}
+    with open(out_path, "w", encoding="utf-8") as f:
+        try:
+            for item in items:
+                row, deltas = process(item, existing.get(get_qid(item)))
+                for key, delta in (deltas or {}).items():
+                    counts[key] = counts.get(key, 0) + delta
+                f.write(json.dumps(row) + "\n")
+        finally:
+            # In a `finally`, not after the loop: a real Ctrl-C (or anything
+            # else escaping `process`) must not skip this. Otherwise the
+            # out-of-window rows this exists to protect are the exact ones
+            # lost, right when a run is being interrupted -- the worst time.
+            counts["carried"] = counts.get("carried", 0) + carry_over_unprocessed(f, existing, expected)
+    return counts

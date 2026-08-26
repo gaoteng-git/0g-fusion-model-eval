@@ -585,7 +585,7 @@ from eval import panel as panel_module  # noqa: E402
 from eval import fuse as fuse_module  # noqa: E402
 from eval import baseline as baseline_module  # noqa: E402
 from eval.grade import grade_replay, load_rows  # noqa: E402
-from eval.replay_io import ResumeMismatchError  # noqa: E402
+from eval.replay_io import ResumeMismatchError, run_replay  # noqa: E402
 
 _results_dir = os.path.join(os.path.dirname(__file__), "eval", "results")
 
@@ -1591,6 +1591,38 @@ try:
 finally:
     panel_module.call_api = _orig_call_api_p
 check("...and --out was never created", not os.path.exists(_bad_model_out))
+
+# --- 23. regressions found reviewing the shared run_replay() extraction ----
+
+# 23a. an exception escaping `process` (a real Ctrl-C is exactly this: a
+#      BaseException the per-item try/except inside each tool can't catch)
+#      must NOT skip carrying forward out-of-window rows -- those are the
+#      ones already paid for, and losing them at the exact moment a run is
+#      being interrupted is the worst time to lose them.
+_carry_repro_path = os.path.join(_results_dir, "test_carry_on_exception.jsonl")
+_repro_existing = {i: {"question_id": i, "val": f"old-{i}"} for i in range(6)}
+_repro_expected = {i: (f"q{i}", "A") for i in range(3)}  # this run's window is qids 0-2
+
+
+def _raise_on_item_1(item, prior):
+    if item == 1:
+        raise RuntimeError("simulated interruption mid-run")
+    return {"question_id": item, "val": f"new-{item}"}, {}
+
+
+try:
+    run_replay([0, 1, 2], lambda x: x, _raise_on_item_1, _carry_repro_path, _repro_existing, _repro_expected)
+    check("run_replay propagates an exception from `process` instead of swallowing it", False)
+except RuntimeError:
+    check("run_replay propagates an exception from `process` instead of swallowing it", True)
+with open(_carry_repro_path, encoding="utf-8") as f:
+    _carry_repro_rows = [json.loads(l) for l in f]
+check("...but still carries forward every out-of-window row before re-raising, even though the "
+      "loop never finished",
+      sorted(r["question_id"] for r in _carry_repro_rows if r["question_id"] >= 3) == [3, 4, 5])
+check("...and still wrote whatever succeeded before the exception (question 0)",
+      any(r["question_id"] == 0 and r["val"] == "new-0" for r in _carry_repro_rows))
+os.remove(_carry_repro_path)
 
 server.shutdown()
 gpqa_tasks_module.REAL_DEFAULT_PATH = _orig_real_default

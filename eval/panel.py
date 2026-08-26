@@ -27,13 +27,12 @@ Run:
       --reuse eval/results/gpqa-panel-fixed4.jsonl --experiment gpqa-panel-hy3
 """
 import argparse
-import json
 import os
 import sys
 
 from .gpqa_tasks import load_tasks
 from .client import call_api
-from .replay_io import carry_over_unprocessed, default_out_path, ensure_out_dir, load_existing
+from .replay_io import add_out_args, default_out_path, ensure_out_dir, load_existing, parse_models, run_replay
 
 
 SCHEMA = "0g.fusion_eval.gpqa.panel.v1"
@@ -74,70 +73,61 @@ def run(fusion_url, fusion_model, models, out_path, limit=None, experiment=None,
     existing = load_existing(out_path, expected, expected_schema=SCHEMA) if resume else {}
     reuse = load_existing(reuse_path, expected, expected_schema=SCHEMA) if reuse_path else {}
 
-    skipped = failed = 0
     dropped = {}  # model -> number of questions where a prior answer for it is being discarded
-    with open(out_path, "w", encoding="utf-8") as f:
-        for task in tasks:
-            qid = task["question_id"]
-            prior = existing.get(qid)
-            # Read from a prior row even if it's marked failed -- a batch
-            # failure (see the except branch below) can still have left some
-            # models successfully cached, and those are worth keeping instead
-            # of re-calling them too.
-            have_here = _panel_by_model(prior) if prior else {}
-            # --models is the FULL desired panel, always -- a model present
-            # here but not in --models gets dropped from the row, silently
-            # except for this count. Surfacing it matters: a near-identical
-            # `eval.baseline --models x --out <file>` ACCUMULATES instead of
-            # replacing, so typing the panel version of that command by
-            # habit would otherwise throw away already-paid panel members
-            # with no visible sign anything happened.
-            for m in set(have_here) - set(models):
-                dropped[m] = dropped.get(m, 0) + 1
-            have_reuse = _panel_by_model(reuse.get(qid, {}))
-            cached, fresh_models = [], []
-            for m in models:
-                if m in have_here:
-                    cached.append(have_here[m])
-                elif m in have_reuse:
-                    cached.append(have_reuse[m])
-                else:
-                    fresh_models.append(m)
 
-            if not fresh_models:
-                # Everything needed was already sitting in --out/--reuse --
-                # no fresh model to call, so skip the round trip entirely
-                # rather than making a call whose only job is to hand back
-                # data we already have.
-                skipped += 1
-                f.write(json.dumps({**_base_row(qid, task), "panel": cached}) + "\n")
-                continue
+    def process(task, prior):
+        qid = task["question_id"]
+        # Read from a prior row even if it's marked failed -- a batch failure
+        # (see the except branch below) can still have left some models
+        # successfully cached, and those are worth keeping instead of
+        # re-calling them too.
+        have_here = _panel_by_model(prior) if prior else {}
+        # --models is the FULL desired panel, always -- a model present here
+        # but not in --models gets dropped from the row, silently except for
+        # this count. Surfacing it matters: a near-identical `eval.baseline
+        # --models x --out <file>` ACCUMULATES instead of replacing, so
+        # typing the panel version of that command by habit would otherwise
+        # throw away already-paid panel members with no visible sign
+        # anything happened.
+        for m in set(have_here) - set(models):
+            dropped[m] = dropped.get(m, 0) + 1
+        have_reuse = _panel_by_model(reuse.get(qid, {}))
+        cached, fresh_models = [], []
+        for m in models:
+            if m in have_here:
+                cached.append(have_here[m])
+            elif m in have_reuse:
+                cached.append(have_reuse[m])
+            else:
+                fresh_models.append(m)
 
-            messages = [{"role": "user", "content": task["instruction"]}]
-            # The call AND the row construction must stay inside this one try
-            # block: indexing the response is itself a failure point, so a
-            # 200-but-wrong-shape response would crash the whole run if the
-            # row were built outside it.
-            try:
-                resp = call_api(fusion_url, fusion_model, messages, panel_only=True,
-                                 cached_panel=cached, extra_panel_models=fresh_models,
-                                 experiment=experiment, question_id=qid)
-                row = {**_base_row(qid, task), "panel": resp["0g_fusion"]["panel"]}
-            except Exception as e:
-                failed += 1
-                print(f"eval.panel_question_failed question_id={qid!r} error={str(e)!r}", file=sys.stderr)
-                # `cached` (whatever was already sitting in --out/--reuse
-                # before this call) survives even though the fresh call for
-                # the rest failed -- a retry can still reuse it instead of
-                # re-paying for models that already succeeded.
-                row = {**_base_row(qid, task), "panel": cached, "failed": True, "error": str(e)}
-            f.write(json.dumps(row) + "\n")
-        # Always carry forward rows outside `expected`, not just when --limit
-        # is set: `expected` can also shrink because load_tasks()'s underlying
-        # dataset file shrank (e.g. re-downloaded with its own --limit) with
-        # no --limit given to THIS run at all. Guarding this on `limit` alone
-        # missed exactly that case and silently deleted already-paid rows.
-        carried = carry_over_unprocessed(f, existing, expected)
+        if not fresh_models:
+            # Everything needed was already sitting in --out/--reuse -- no
+            # fresh model to call, so skip the round trip entirely rather
+            # than making a call whose only job is to hand back data we
+            # already have.
+            return {**_base_row(qid, task), "panel": cached}, {"skipped": 1}
+
+        messages = [{"role": "user", "content": task["instruction"]}]
+        # The call AND the row construction must stay inside this one try
+        # block: indexing the response is itself a failure point, so a
+        # 200-but-wrong-shape response would crash the whole run if the row
+        # were built outside it.
+        try:
+            resp = call_api(fusion_url, fusion_model, messages, panel_only=True,
+                             cached_panel=cached, extra_panel_models=fresh_models,
+                             experiment=experiment, question_id=qid)
+            return {**_base_row(qid, task), "panel": resp["0g_fusion"]["panel"]}, {}
+        except Exception as e:
+            print(f"eval.panel_question_failed question_id={qid!r} error={str(e)!r}", file=sys.stderr)
+            # `cached` (whatever was already sitting in --out/--reuse before
+            # this call) survives even though the fresh call for the rest
+            # failed -- a retry can still reuse it instead of re-paying for
+            # models that already succeeded.
+            return {**_base_row(qid, task), "panel": cached, "failed": True, "error": str(e)}, {"failed": 1}
+
+    counts = run_replay(tasks, lambda t: t["question_id"], process, out_path, existing, expected)
+    skipped, carried, failed = counts.get("skipped", 0), counts.get("carried", 0), counts.get("failed", 0)
     if skipped:
         print(f"eval.panel_resumed skipped={skipped} (already had every requested model for these "
               f"questions at {out_path!r})", file=sys.stderr)
@@ -160,14 +150,10 @@ if __name__ == "__main__":
     p.add_argument("--fusion-model", default="0g/fusion-preview")
     p.add_argument("--models", required=True, help="Comma-separated full desired panel for this file.")
     p.add_argument("--reuse", default=None, help="Pull already-computed answers from this file where possible.")
-    p.add_argument("--out", default=None, help="Defaults to results/<experiment>.jsonl.")
-    p.add_argument("--limit", type=int, default=None)
+    add_out_args(p)
     p.add_argument("--experiment", default=None, help="Defaults to panel-<models joined by '+'>.")
-    p.add_argument("--no-resume", action="store_true", help="Ignore any existing rows at --out.")
     args = p.parse_args()
-    models = list(dict.fromkeys(m.strip() for m in args.models.split(",") if m.strip()))
-    if not models:
-        sys.exit("--models must name at least one model")
+    models = parse_models(args.models)
     experiment = args.experiment or f"panel-{'+'.join(models)}"
     out = args.out or default_out_path(experiment)
     print(run(args.fusion_url, args.fusion_model, models, out, args.limit, experiment,
