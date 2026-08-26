@@ -1,15 +1,17 @@
 """Self-test suite, plain asserts (no external test framework). Runs entirely
 offline via the FAKE llm stand-in (no ZG_UPSTREAM_BASE_URL set). Covers the
-GPQA-round requirements: reasoning_effort on for panel/synthesis/baseline, off
-for judge (with defensive stripping), panel evidence carrying reasoning AND
-content, thinking-extraction for both real-world field patterns, GPQA task
-loading + letter extraction/grading, the end-to-end HTTP round trip,
-per-call log-file naming/content (call_logs/<experiment>__<role>__<model>.jsonl),
-the cached_panel/extra_panel_models partial-reuse mode and panel_only (both
-used by eval/fuse.py and eval/panel.py), and the eval.panel / eval.fuse /
-eval.baseline / eval.grade CLI tools themselves -- including the concrete
-regression test for the reason eval.panel exists at all: building/extending a
-panel must make ZERO judge/synthesis calls.
+core product-simulation pipeline (mock_fusion_api: reasoning_effort on for
+panel/synthesis/baseline, off for judge with defensive <think>-stripping,
+panel evidence carrying reasoning AND content, thinking-extraction for both
+real-world field patterns, the cached_panel/extra_panel_models/panel_only
+mechanisms) -- none of which the eval CLI actually calls into anymore, but
+all of which still simulate the real product and are still tested as such --
+plus the eval CLI itself: eval.sample (extract a subset of questions, tagged
+with their original index so later results can be merged), eval.panel /
+eval.fuse / eval.baseline (each a pure function of its explicit --input:
+no resume, no --limit, no implicit state, every run overwrites --out
+completely), and eval.grade (scores each given file independently, no
+merging, so there is nothing for two files to disagree about).
 Run: python3 tests.py
 """
 import contextlib
@@ -31,25 +33,18 @@ from mock_fusion_api import pipeline, panel_config as cfg  # noqa: E402
 from mock_fusion_api.server import Handler  # noqa: E402
 from http.server import ThreadingHTTPServer  # noqa: E402
 
-import eval.gpqa_tasks as gpqa_tasks_module  # noqa: E402
-# load_tasks() silently switches its default from the fake sample set to the
-# real, gated GPQA file the moment that file exists on disk one directory
-# above this repo (see gpqa_tasks.py's docstring) -- and in this environment
-# it does. Every test below that calls load_tasks() (directly or via
-# eval.panel/eval.baseline) does so with no explicit path, so leaving that
-# switch live would risk loading -- and, on any assertion failure, PRINTING --
-# real gated question text. Force the sample set unconditionally for this
-# whole run; the resume-safety tests further down restore/override it
-# themselves, on purpose, to exercise the dataset-swap guard.
-_orig_real_default = gpqa_tasks_module.REAL_DEFAULT_PATH
-gpqa_tasks_module.REAL_DEFAULT_PATH = gpqa_tasks_module.SAMPLE_PATH
-
 PASS = []
 
 
 def check(name, cond):
     PASS.append((name, bool(cond)))
     print(("PASS " if cond else "FAIL ") + name)
+
+
+def _cli(*args):
+    return __import__("subprocess").run(
+        [__import__("sys").executable, "-m", *args],
+        cwd=os.path.dirname(os.path.abspath(__file__)), capture_output=True, text=True)
 
 
 # --- 1. extract_thinking: both real-world field patterns -------------------
@@ -211,8 +206,8 @@ try:
 finally:
     cfg.JUDGE_MODEL = _orig_judge_model2
 
-# --- 6. passthrough (baseline) path: forwards reasoning_effort, normalizes
-#        reasoning_content the same way as the fusion path ------------------
+# --- 6. passthrough path: forwards reasoning_effort, normalizes reasoning_content
+#        the same way as the fusion path, and honors an explicit `role` -----
 plain = pipeline.handle_chat_completion({"model": "some-baseline", "messages": messages, "reasoning_effort": "high"})
 check("baseline passthrough exposes reasoning_content when thinking is requested",
       bool(plain["choices"][0]["message"].get("reasoning_content")))
@@ -223,22 +218,84 @@ check("baseline passthrough strips inline <think> out of content for MiniMax-sty
 check("...and surfaces it via reasoning_content instead",
       bool(minimax_like["choices"][0]["message"].get("reasoning_content")))
 
-# --- 7. GPQA task loading: deterministic shuffle, correct_letter matches ---
-from eval.gpqa_tasks import load_tasks  # noqa: E402
+# eval.panel/eval.fuse/eval.baseline are ALL just this passthrough with a
+# different `role`, for clearer call-log naming -- an explicit role in the
+# request must be honored, falling back to "baseline" only when absent
+# (unchanged default, regression guard).
+TEST_EXPERIMENT = "unit-test-logging-exp"
+pipeline.handle_chat_completion({"model": "some-panel-model", "messages": messages, "role": "panel",
+                                  "experiment": TEST_EXPERIMENT})
+_role_log = os.path.join(llm_client.LOG_DIR, f"{TEST_EXPERIMENT}__panel__{llm_client._sanitize('some-panel-model')}.jsonl")
+check("plain passthrough honors an explicit `role` in the request instead of hardcoding 'baseline'",
+      os.path.exists(_role_log))
+pipeline.handle_chat_completion({"model": "some-other-model", "messages": messages, "experiment": TEST_EXPERIMENT})
+_default_role_log = os.path.join(llm_client.LOG_DIR,
+                                   f"{TEST_EXPERIMENT}__baseline__{llm_client._sanitize('some-other-model')}.jsonl")
+check("...and still defaults to role='baseline' when the request doesn't set one (unchanged default)",
+      os.path.exists(_default_role_log))
+for f in glob.glob(os.path.join(llm_client.LOG_DIR, f"{TEST_EXPERIMENT}__*")):
+    os.remove(f)
 
-tasks = load_tasks(limit=3)
-check("load_tasks returns the requested number of tasks", len(tasks) == 3)
-check("every task has question_id/instruction/correct_letter",
-      all({"question_id", "instruction", "correct_letter"} <= set(t) for t in tasks))
-check("every task's instruction contains the final-answer format instruction",
-      all(cfg.FINAL_LETTER_INSTRUCTION in t["instruction"] for t in tasks))
-# re-loading must reproduce the same shuffle/correct_letter (index-seeded, not global RNG)
-tasks_again = load_tasks(limit=3)
-check("shuffle is deterministic across repeated loads",
-      [t["correct_letter"] for t in tasks] == [t["correct_letter"] for t in tasks_again])
+# --- 7. gpqa_tasks: load_questions/format_question -------------------------
+from eval.gpqa_tasks import load_questions, format_question, SAMPLE_PATH  # noqa: E402
 
-# --- 8. grade: final-letter extraction ------------------------------------
-from eval.grade import extract_final_letter  # noqa: E402
+questions = load_questions(SAMPLE_PATH)
+check("load_questions returns one (question_id, row) pair per line", len(questions) == 5)
+check("question_id defaults to position when the row has no explicit question_id field",
+      [qid for qid, _ in questions] == [0, 1, 2, 3, 4])
+
+_instruction0, _correct_letter0 = format_question(questions[0][1], questions[0][0])
+check("format_question's instruction contains the final-answer format instruction",
+      cfg.FINAL_LETTER_INSTRUCTION in _instruction0)
+check("format_question returns one of A/B/C/D", _correct_letter0 in "ABCD")
+
+questions_again = load_questions(SAMPLE_PATH)
+check("shuffle is deterministic across repeated loads (question_id-seeded, not global RNG)",
+      [format_question(row, qid)[1] for qid, row in questions]
+      == [format_question(row, qid)[1] for qid, row in questions_again])
+
+_results_dir = os.path.join(os.path.dirname(__file__), "eval", "results")
+os.makedirs(_results_dir, exist_ok=True)
+
+# an explicit question_id field (as eval.sample.py writes) must be honored,
+# not overridden by position -- this is what keeps a merge across sampled
+# files correct
+_qid_test_path = os.path.join(_results_dir, "test_explicit_qid.jsonl")
+with open(_qid_test_path, "w", encoding="utf-8") as f:
+    f.write(json.dumps({**questions[2][1], "question_id": 99}) + "\n")
+_tagged = load_questions(_qid_test_path)
+check("an explicit question_id field in the row is honored, not overridden by file position",
+      _tagged[0][0] == 99)
+
+# format_question must seed the shuffle by question_id, not by the row's
+# position in whatever file happens to be open -- put question 2's row at
+# position 0 in a standalone file, tagged with its ORIGINAL id (2, not its
+# new position); it must shuffle exactly the same way it did loaded from the
+# full 5-row file at position 2.
+_same_id_path = os.path.join(_results_dir, "test_same_id_diff_position.jsonl")
+with open(_same_id_path, "w", encoding="utf-8") as f:
+    f.write(json.dumps({**questions[2][1], "question_id": 2}) + "\n")
+_relocated = load_questions(_same_id_path)
+check("format_question seeds the shuffle by question_id, not by file position -- the SAME "
+      "question (row content), tagged with the SAME id, shuffles identically whether it's at "
+      "position 2 in the full file or position 0 in a standalone one-row file",
+      format_question(_relocated[0][1], _relocated[0][0]) == format_question(questions[2][1], questions[2][0]))
+os.remove(_same_id_path)
+os.remove(_qid_test_path)
+
+_bad_path = os.path.join(_results_dir, "test_missing_column.jsonl")
+with open(_bad_path, "w", encoding="utf-8") as f:
+    f.write(json.dumps({"Question": "Q?", "Correct Answer": "A"}) + "\n")  # missing 3 required columns
+try:
+    load_questions(_bad_path)
+    check("load_questions raises a clear error when a required column is missing", False)
+except ValueError as e:
+    check("load_questions raises a clear error when a required column is missing",
+          "Incorrect Answer 1" in str(e))
+os.remove(_bad_path)
+
+# --- 8. grade: final-letter extraction --------------------------------------
+from eval.grade import extract_final_letter, grade_file  # noqa: E402
 
 check("extracts a plain 'Final Answer: B'", extract_final_letter("blah blah\nFinal Answer: B") == "B")
 check("extracts through markdown bold", extract_final_letter("**Final Answer: C**") == "C")
@@ -278,7 +335,6 @@ except RuntimeError as e:
           "500" in str(e) and "cached_panel" in str(e))
 
 # --- 10. per-call logging: file named <experiment>__<role>__<model>.jsonl ---
-TEST_EXPERIMENT = "unit-test-logging-exp"
 _before = set(glob.glob(os.path.join(llm_client.LOG_DIR, f"{TEST_EXPERIMENT}__*")))
 for f in _before:
     os.remove(f)
@@ -310,11 +366,6 @@ synthesis_log = os.path.join(
     llm_client.LOG_DIR, f"{TEST_EXPERIMENT}__synthesis__{llm_client._sanitize(cfg.SYNTHESIS_MODEL)}.jsonl")
 check("run_judge(experiment=...) writes a judge-role log file", os.path.exists(judge_log))
 check("run_synthesis(experiment=...) writes a synthesis-role log file", os.path.exists(synthesis_log))
-
-pipeline.handle_chat_completion({"model": "some-baseline", "messages": messages, "reasoning_effort": "high",
-                                  "experiment": TEST_EXPERIMENT})
-baseline_log = os.path.join(llm_client.LOG_DIR, f"{TEST_EXPERIMENT}__baseline__{llm_client._sanitize('some-baseline')}.jsonl")
-check("baseline passthrough with an experiment name writes a baseline-role log file", os.path.exists(baseline_log))
 
 no_exp_before = set(glob.glob(os.path.join(llm_client.LOG_DIR, "None__*")))
 pipeline.handle_chat_completion({"model": "some-other-baseline", "messages": messages})  # no experiment field at all
@@ -544,10 +595,8 @@ check("no cached_panel/extra_panel_models -> unchanged default behaviour (full c
       len(default_run["0g_fusion"]["panel"]) == len(cfg.PANEL_MODELS))
 
 # --- 13. panel_only: pipeline.run_fusion stops after the panel, no judge or
-#         synthesis call at all -- the mechanism eval.panel relies on to
-#         build/extend a panel for free (see run_fusion's docstring). This is
-#         the direct fix for the $67.23/198-question wasted judge+synthesis
-#         cost a 4-fixed-panel-only base run used to pay for unconditionally --
+#         synthesis call at all. Still a real, tested feature of the product
+#         simulation even though the eval CLI doesn't use it anymore -------
 _orig_run_judge, _orig_run_synthesis = pipeline.run_judge, pipeline.run_synthesis
 
 
@@ -565,8 +614,6 @@ try:
           set(panel_only_resp["0g_fusion"]) == {"panel"}
           and len(panel_only_resp["0g_fusion"]["panel"]) == len(cfg.PANEL_MODELS))
 
-    # combined with cached_panel/extra_panel_models: same zero-cost guarantee,
-    # and cached+fresh still merge exactly like the non-panel_only path
     combo_resp = pipeline.run_fusion({"messages": messages, "panel_only": True,
                                        "cached_panel": [_cached_entry], "extra_panel_models": ["panel-a"]})
     check("panel_only + cached_panel/extra_panel_models still makes no judge/synthesis call",
@@ -575,1147 +622,608 @@ try:
 finally:
     pipeline.run_judge, pipeline.run_synthesis = _orig_run_judge, _orig_run_synthesis
 
-# panel_only being absent/falsy must be unchanged from before (regression guard)
 check("panel_only defaulting to falsy is unchanged -- still runs judge+synthesis",
       "choices" in pipeline.run_fusion({"messages": messages}))
 
-# --- 14. eval.panel: build a panel file -- resume, growing --limit, and (the
-#          whole point) ZERO judge/synthesis calls made along the way -------
+# --- 14. eval.sample: extract a subset of a question file by index, tagged
+#          with each row's ORIGINAL absolute index as question_id ----------
+from eval.sample import parse_indices, run as sample_run  # noqa: E402
+
+check("parse_indices: comma list", parse_indices("0,2,4") == [0, 2, 4])
+check("parse_indices: a range is inclusive on both ends", parse_indices("0-4") == [0, 1, 2, 3, 4])
+check("parse_indices: mixed ranges + singles, deduped and sorted",
+      parse_indices("2,0-1,4,3") == [0, 1, 2, 3, 4])
+try:
+    parse_indices("")
+    check("parse_indices rejects an empty --indices", False)
+except SystemExit:
+    check("parse_indices rejects an empty --indices", True)
+
+_sample_path = os.path.join(_results_dir, "test_sample_first3.jsonl")
+sample_run(SAMPLE_PATH, [0, 1, 2], _sample_path)
+_sampled = load_questions(_sample_path)
+check("eval.sample extracts exactly the requested rows, tagged with their original index",
+      [qid for qid, _ in _sampled] == [0, 1, 2])
+check("the extracted rows' actual content matches the source file's rows at those indices",
+      all(_sampled[i][1]["Question"] == questions[i][1]["Question"] for i in range(3)))
+
+_sample_path2 = os.path.join(_results_dir, "test_sample_middle_of_sample.jsonl")
+sample_run(_sample_path, [1], _sample_path2)  # position 1 within the 3-row sample == original index 1
+_resampled = load_questions(_sample_path2)
+check("sub-sampling an already-sampled file preserves the ORIGINAL absolute question_id "
+      "(not renumbered from the sample's own position) -- what makes 'sample the rest later, "
+      "merge the results' actually work",
+      _resampled[0][0] == 1)
+
+_bad_sample_path = os.path.join(_results_dir, "test_sample_bad.jsonl")
+try:
+    sample_run(SAMPLE_PATH, [0, 99], _bad_sample_path)
+    check("eval.sample rejects an out-of-range index", False)
+except ValueError as e:
+    check("eval.sample rejects an out-of-range index", "99" in str(e))
+check("...and nothing was written for the bad request", not os.path.exists(_bad_sample_path))
+
+sample_run(SAMPLE_PATH, [3, 4], _sample_path)  # same --out as before, different indices
+check("re-running eval.sample against the same --out overwrites it completely",
+      [qid for qid, _ in load_questions(_sample_path)] == [3, 4])
+
+for _p in (_sample_path, _sample_path2):
+    os.remove(_p)
+
+_cli_sample_out = os.path.join(_results_dir, "test_sample_cli.jsonl")
+_r = _cli("eval.sample", "--input", SAMPLE_PATH, "--indices", "0-1", "--out", _cli_sample_out)
+check("the eval.sample CLI runs end to end", _r.returncode == 0)
+check("...and writes the right rows", [qid for qid, _ in load_questions(_cli_sample_out)] == [0, 1])
+os.remove(_cli_sample_out)
+
+# --- 15. eval.panel: one model, one input file, one output file, no resume -
 from eval import panel as panel_module  # noqa: E402
-from eval import fuse as fuse_module  # noqa: E402
-from eval import baseline as baseline_module  # noqa: E402
-from eval.grade import grade_replay, load_rows  # noqa: E402
-from eval.replay_io import ResumeMismatchError, run_replay  # noqa: E402
 
-_results_dir = os.path.join(os.path.dirname(__file__), "eval", "results")
+_panel_input = os.path.join(_results_dir, "test_panel_input.jsonl")
+sample_run(SAMPLE_PATH, [0, 1, 2], _panel_input)
 
+_panel_out = os.path.join(_results_dir, "test_panel_out.jsonl")
+panel_module.run(base_url, "panel-a", _panel_input, _panel_out, experiment="test-panel-exp")
+_panel_rows = [json.loads(l) for l in open(_panel_out, encoding="utf-8")]
+check("eval.panel writes exactly one row per input question", len(_panel_rows) == 3)
+check("every row has question_id/instruction/correct_letter/model/content/reasoning",
+      all({"question_id", "instruction", "correct_letter", "model", "content", "reasoning"} <= set(r)
+          for r in _panel_rows))
+check("every row's model is the one requested", all(r["model"] == "panel-a" for r in _panel_rows))
+check("question_ids match the input file's, in order", [r["question_id"] for r in _panel_rows] == [0, 1, 2])
+check("eval.panel logs its calls under role=panel",
+      os.path.exists(os.path.join(llm_client.LOG_DIR, "test-panel-exp__panel__panel-a.jsonl")))
 
-def _cli(*args):
-    return __import__("subprocess").run(
-        [__import__("sys").executable, "-m", *args],
-        cwd=os.path.dirname(os.path.abspath(__file__)), capture_output=True, text=True)
-
-
-panel_path = os.path.join(_results_dir, "test_panel.jsonl")
-PANEL_EXP = "test-panel-exp"
-for f in glob.glob(os.path.join(llm_client.LOG_DIR, f"{PANEL_EXP}__*")):
-    os.remove(f)
-
-panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS), panel_path, limit=3, experiment=PANEL_EXP)
-with open(panel_path, encoding="utf-8") as f:
-    panel_rows_out = [json.loads(l) for l in f]
-check("eval.panel writes one row per question", len(panel_rows_out) == 3)
-check("every panel row has the full requested panel, correct schema",
-      all(r["schema"] == "0g.fusion_eval.gpqa.panel.v1"
-          and {p["model"] for p in r["panel"]} == set(cfg.PANEL_MODELS) for r in panel_rows_out))
-
-panel_logs = glob.glob(os.path.join(llm_client.LOG_DIR, f"{PANEL_EXP}__panel__*"))
-judge_logs = glob.glob(os.path.join(llm_client.LOG_DIR, f"{PANEL_EXP}__judge__*"))
-synthesis_logs = glob.glob(os.path.join(llm_client.LOG_DIR, f"{PANEL_EXP}__synthesis__*"))
-check("eval.panel makes real panel calls (log files exist)", len(panel_logs) == len(cfg.PANEL_MODELS))
-check("*** the $67.23/198q fix: eval.panel makes ZERO judge calls ***", judge_logs == [])
-check("*** eval.panel makes ZERO synthesis calls ***", synthesis_logs == [])
-for f in panel_logs:
-    os.remove(f)
-
-_orig_call_api_p = panel_module.call_api
-_pcalls = {"n": 0}
+_orig_call_api_panel = panel_module.call_api
+_pcount = {"n": 0}
 
 
-def _counting_call_api_p(*a, **kw):
-    _pcalls["n"] += 1
-    return _orig_call_api_p(*a, **kw)
+def _counting_panel_call(url, model, msgs, **kw):
+    _pcount["n"] += 1
+    return _orig_call_api_panel(url, model, msgs, **kw)
 
 
-panel_module.call_api = _counting_call_api_p
+panel_module.call_api = _counting_panel_call
 try:
-    stderr_p = io.StringIO()
-    with contextlib.redirect_stderr(stderr_p):
-        panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS), panel_path, limit=3,
-                          experiment=PANEL_EXP)
-    check("re-running eval.panel for the exact same models makes zero fresh calls (fully resumed)",
-          _pcalls["n"] == 0)
-    check("resume prints a clear skipped= message", "eval.panel_resumed skipped=3" in stderr_p.getvalue())
-
-    # growing the window (limit 3 -> 5) must only call for the 2 NEW questions
-    _pcalls["n"] = 0
-    panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS), panel_path, limit=5,
-                      experiment=PANEL_EXP)
-    check("growing --limit only calls for the newly-included questions", _pcalls["n"] == 2)
-    with open(panel_path, encoding="utf-8") as f:
-        grown_rows = [json.loads(l) for l in f]
-    check("growing --limit keeps the earlier rows and adds the new ones, in order",
-          len(grown_rows) == 5 and [r["question_id"] for r in grown_rows] == [0, 1, 2, 3, 4])
+    panel_module.run(base_url, "panel-a", _panel_input, _panel_out, experiment="test-panel-exp")
+    check("eval.panel makes a fresh call for every question every run, regardless of any prior "
+          "--out content -- no resume/skip logic exists at all",
+          _pcount["n"] == 3)
 finally:
-    panel_module.call_api = _orig_call_api_p
-os.remove(panel_path)
+    panel_module.call_api = _orig_call_api_panel
 
-# --- 15. eval.panel --reuse: pull already-computed answers from a DIFFERENT
-#          file, call only what's genuinely missing, including the zero-HTTP
-#          path when nothing is missing at all -------------------------------
-base_panel_path = os.path.join(_results_dir, "test_panel_base.jsonl")
-panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS), base_panel_path, limit=3,
-                  experiment="test-panel-base")
+_call_count = {"n": 0}
 
-variant_panel_path = os.path.join(_results_dir, "test_panel_variant.jsonl")
-_pcalls["n"] = 0
-panel_module.call_api = _counting_call_api_p
+
+def _fail_2nd_call(url, model, msgs, **kw):
+    _call_count["n"] += 1
+    if _call_count["n"] == 2:
+        raise RuntimeError("simulated failure for the 2nd question")
+    return _orig_call_api_panel(url, model, msgs, **kw)
+
+
+panel_module.call_api = _fail_2nd_call
 try:
-    panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS) + ["candidate-x"],
-                      variant_panel_path, limit=3, experiment="test-panel-variant", reuse_path=base_panel_path)
-    # one call_api round trip per QUESTION (each carries only the still-missing
-    # models as extra_panel_models) -- 3 questions, so 3 calls, not 3x(models+1)
-    check("--reuse calls once per question, carrying only the ONE genuinely new model each time",
-          _pcalls["n"] == 3)
+    _panel_fail_out = os.path.join(_results_dir, "test_panel_fail.jsonl")
+    panel_module.run(base_url, "panel-b", _panel_input, _panel_fail_out, experiment="test-panel-fail")
 finally:
-    panel_module.call_api = _orig_call_api_p
-
-with open(variant_panel_path, encoding="utf-8") as f:
-    variant_panel_rows = [json.loads(l) for l in f]
-with open(base_panel_path, encoding="utf-8") as f:
-    base_panel_rows = [json.loads(l) for l in f]
-check("the reused models' entries are copied byte-for-byte from --reuse, not recomputed",
-      all({p["model"]: p for p in vr["panel"] if p["model"] in cfg.PANEL_MODELS} == {p["model"]: p for p in br["panel"]}
-          for vr, br in zip(variant_panel_rows, base_panel_rows)))
-check("the new candidate model is present alongside the reused ones",
-      all(any(p["model"] == "candidate-x" for p in r["panel"]) for r in variant_panel_rows))
-check("variant panel has exactly len(PANEL_MODELS)+1 members",
-      all(len(r["panel"]) == len(cfg.PANEL_MODELS) + 1 for r in variant_panel_rows))
-
-# zero-HTTP-call optimization: re-running the same --reuse variant makes no calls
-_pcalls["n"] = 0
-panel_module.call_api = _counting_call_api_p
-try:
-    panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS) + ["candidate-x"],
-                      variant_panel_path, limit=3, experiment="test-panel-variant", reuse_path=base_panel_path)
-    check("re-running the same --reuse variant makes zero calls (everything already at --out)",
-          _pcalls["n"] == 0)
-finally:
-    panel_module.call_api = _orig_call_api_p
-
-# a brand-new --out whose every model is covered by --reuse alone (nothing at
-# --out yet) must also make zero calls -- the cached-but-no-existing-row path
-fully_reused_path = os.path.join(_results_dir, "test_panel_fully_reused.jsonl")
-_pcalls["n"] = 0
-panel_module.call_api = _counting_call_api_p
-try:
-    panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS), fully_reused_path, limit=3,
-                      experiment="test-panel-fully-reused", reuse_path=base_panel_path)
-    check("a brand-new --out fully covered by --reuse makes zero HTTP calls", _pcalls["n"] == 0)
-finally:
-    panel_module.call_api = _orig_call_api_p
-with open(fully_reused_path, encoding="utf-8") as f:
-    fully_reused_rows = [json.loads(l) for l in f]
-check("...and still produces a correct, complete panel file",
-      all({p["model"] for p in r["panel"]} == set(cfg.PANEL_MODELS) for r in fully_reused_rows))
-os.remove(fully_reused_path)
-
-# failure handling: a model call failing must be caught, row marked failed,
-# other questions unaffected, run does not abort
-def _fail_candidate(url, model, msgs, **kw):
-    if "candidate-y" in (kw.get("extra_panel_models") or []):
-        raise RuntimeError("simulated candidate failure")
-    return _orig_call_api_p(url, model, msgs, **kw)
+    panel_module.call_api = _orig_call_api_panel
+_fail_rows = [json.loads(l) for l in open(_panel_fail_out, encoding="utf-8")]
+check("eval.panel writes one row per question even when one question's call fails",
+      len(_fail_rows) == 3)
+check("the failed question is marked failed with the error captured, others succeeded",
+      _fail_rows[1].get("failed") is True and "simulated failure" in _fail_rows[1].get("error", "")
+      and "failed" not in _fail_rows[0] and "failed" not in _fail_rows[2])
+os.remove(_panel_fail_out)
 
 
-panel_fail_path = os.path.join(_results_dir, "test_panel_fail.jsonl")
-panel_module.call_api = _fail_candidate
-try:
-    stderr_pf = io.StringIO()
-    with contextlib.redirect_stderr(stderr_pf):
-        panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS) + ["candidate-y"],
-                          panel_fail_path, limit=3, experiment="test-panel-fail", reuse_path=base_panel_path)
-finally:
-    panel_module.call_api = _orig_call_api_p
-with open(panel_fail_path, encoding="utf-8") as f:
-    panel_fail_rows = [json.loads(l) for l in f]
-check("eval.panel writes one row per question even when a model call fails (run doesn't abort)",
-      len(panel_fail_rows) == 3)
-check("the failed question's row is marked failed with the error captured",
-      all(r.get("failed") is True and "simulated candidate failure" in r.get("error", "") for r in panel_fail_rows))
-check("eval.panel prints a clear per-question failure warning naming the question_id",
-      "eval.panel_question_failed" in stderr_pf.getvalue())
-os.remove(panel_fail_path)
-
-# a 200-but-wrong-shape response (not an exception) must ALSO be caught -- the
-# row construction sits in the SAME try block as the call, on purpose
 def _malformed_shape_panel(url, model, msgs, **kw):
-    if "candidate-shape" in (kw.get("extra_panel_models") or []):
-        return {"0g_fusion": {}}  # 200-ok, valid JSON, but missing "panel" -> KeyError on use
-    return _orig_call_api_p(url, model, msgs, **kw)
-
-
-panel_shape_path = os.path.join(_results_dir, "test_panel_shape.jsonl")
-panel_module.call_api = _malformed_shape_panel
-try:
-    panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS) + ["candidate-shape"],
-                      panel_shape_path, limit=2, experiment="test-panel-shape", reuse_path=base_panel_path)
-finally:
-    panel_module.call_api = _orig_call_api_p
-with open(panel_shape_path, encoding="utf-8") as f:
-    panel_shape_rows = [json.loads(l) for l in f]
-check("eval.panel doesn't crash when a call succeeds but returns a malformed/wrong-shape response",
-      len(panel_shape_rows) == 2)
-check("the malformed-shape question is caught and marked failed (KeyError caught by the same try)",
-      all(r.get("failed") is True for r in panel_shape_rows))
-os.remove(panel_shape_path)
-os.remove(base_panel_path)
-os.remove(variant_panel_path)
-
-# --- 16. eval.fuse: judge+synthesis over a panel file, with ZERO fresh panel
-#          calls -- the panel is used exactly as given ----------------------
-fuse_panel_path = os.path.join(_results_dir, "test_fuse_panel.jsonl")
-panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS), fuse_panel_path, limit=3,
-                  experiment="test-fuse-panel-src")
-
-fuse_out_path = os.path.join(_results_dir, "test_fuse_out.jsonl")
-FUSE_EXP = "test-fuse-exp"
-for f in glob.glob(os.path.join(llm_client.LOG_DIR, f"{FUSE_EXP}__*")):
-    os.remove(f)
-fuse_module.run(base_url, "0g/fusion-preview", fuse_panel_path, fuse_out_path, experiment=FUSE_EXP)
-
-with open(fuse_out_path, encoding="utf-8") as f:
-    fuse_rows = [json.loads(l) for l in f]
-with open(fuse_panel_path, encoding="utf-8") as f:
-    fuse_panel_rows = [json.loads(l) for l in f]
-check("eval.fuse writes one row per panel-file row", len(fuse_rows) == 3)
-check("every row has schema + a real fusion answer + the SAME panel it was given",
-      all(r["schema"] == "0g.fusion_eval.gpqa.replay.v1" and r["fusion"]["content"] and r["panel"] == pr["panel"]
-          for r, pr in zip(fuse_rows, fuse_panel_rows)))
-
-fuse_panel_logs = glob.glob(os.path.join(llm_client.LOG_DIR, f"{FUSE_EXP}__panel__*"))
-fuse_judge_logs = glob.glob(os.path.join(llm_client.LOG_DIR, f"{FUSE_EXP}__judge__*"))
-fuse_synth_logs = glob.glob(os.path.join(llm_client.LOG_DIR, f"{FUSE_EXP}__synthesis__*"))
-check("eval.fuse makes ZERO fresh panel calls (the panel is used exactly as given)", fuse_panel_logs == [])
-check("eval.fuse DOES make the judge call -- this is the one step meant to cost it", len(fuse_judge_logs) == 1)
-check("eval.fuse DOES make the synthesis call", len(fuse_synth_logs) == 1)
-for f in fuse_judge_logs + fuse_synth_logs:
-    os.remove(f)
-
-_orig_call_api_f = fuse_module.call_api
-_fcalls = {"n": 0}
-
-
-def _counting_call_api_f(*a, **kw):
-    _fcalls["n"] += 1
-    return _orig_call_api_f(*a, **kw)
-
-
-fuse_module.call_api = _counting_call_api_f
-try:
-    stderr_f = io.StringIO()
-    with contextlib.redirect_stderr(stderr_f):
-        fuse_module.run(base_url, "0g/fusion-preview", fuse_panel_path, fuse_out_path, experiment=FUSE_EXP)
-    check("re-running eval.fuse against the same panel/out makes zero fresh calls (fully resumed)",
-          _fcalls["n"] == 0)
-    check("resume prints a clear skipped= message", "eval.fuse_resumed skipped=3" in stderr_f.getvalue())
-finally:
-    fuse_module.call_api = _orig_call_api_f
-
-# a panel row that itself failed (or has no panel) must be skipped, not crash,
-# and marked failed in the fuse output -- no call attempted for it
-panel_rows_for_fail = list(fuse_panel_rows)
-panel_rows_for_fail[1] = {**panel_rows_for_fail[1], "failed": True, "error": "pretend panel build failed", "panel": None}
-failed_panel_path = os.path.join(_results_dir, "test_fuse_panel_failed.jsonl")
-with open(failed_panel_path, "w", encoding="utf-8") as f:
-    for r in panel_rows_for_fail:
-        f.write(json.dumps(r) + "\n")
-
-fuse_from_failed_path = os.path.join(_results_dir, "test_fuse_from_failed.jsonl")
-_fcalls["n"] = 0
-fuse_module.call_api = _counting_call_api_f
-try:
-    stderr_ff = io.StringIO()
-    with contextlib.redirect_stderr(stderr_ff):
-        fuse_module.run(base_url, "0g/fusion-preview", failed_panel_path, fuse_from_failed_path)
-    check("a failed/missing panel row costs zero calls (skipped before any HTTP happens)", _fcalls["n"] == 2)
-finally:
-    fuse_module.call_api = _orig_call_api_f
-with open(fuse_from_failed_path, encoding="utf-8") as f:
-    fuse_from_failed_rows = [json.loads(l) for l in f]
-check("the row whose panel had failed is carried through as failed, not crashed on",
-      fuse_from_failed_rows[1].get("failed") is True)
-check("the other 2 rows fused normally", all(fuse_from_failed_rows[i]["fusion"]["content"] for i in (0, 2)))
-check("eval.fuse prints a clear 'no panel available' skip message naming the question_id",
-      "eval.fuse_question_skipped" in stderr_ff.getvalue())
-os.remove(failed_panel_path)
-os.remove(fuse_from_failed_path)
-
-# a call that fails must be caught and marked, not abort the run
-def _fail_fuse_q1(url, model, msgs, **kw):
-    if kw.get("question_id") == 1:
-        raise RuntimeError("simulated fuse failure for question 1")
-    return _orig_call_api_f(url, model, msgs, **kw)
-
-
-fuse_catch_path = os.path.join(_results_dir, "test_fuse_catch.jsonl")
-fuse_module.call_api = _fail_fuse_q1
-try:
-    fuse_module.run(base_url, "0g/fusion-preview", fuse_panel_path, fuse_catch_path)
-finally:
-    fuse_module.call_api = _orig_call_api_f
-with open(fuse_catch_path, encoding="utf-8") as f:
-    fuse_catch_rows = [json.loads(l) for l in f]
-check("eval.fuse writes one row per question even when one question's call fails", len(fuse_catch_rows) == 3)
-check("the failed question is marked failed with the error captured, others unaffected",
-      fuse_catch_rows[1].get("failed") is True and "simulated fuse failure" in fuse_catch_rows[1].get("error", "")
-      and fuse_catch_rows[0]["fusion"]["content"] and fuse_catch_rows[2]["fusion"]["content"])
-os.remove(fuse_catch_path)
-
-# 200-but-wrong-shape must ALSO be caught (same try-block-scope lesson)
-def _malformed_shape_fuse(url, model, msgs, **kw):
     return {"choices": []}  # 200-ok, valid JSON, but empty choices -> IndexError on use
 
 
-fuse_shape_path = os.path.join(_results_dir, "test_fuse_shape.jsonl")
-fuse_module.call_api = _malformed_shape_fuse
+panel_module.call_api = _malformed_shape_panel
 try:
-    fuse_module.run(base_url, "0g/fusion-preview", fuse_panel_path, fuse_shape_path)
+    _panel_shape_out = os.path.join(_results_dir, "test_panel_shape.jsonl")
+    panel_module.run(base_url, "panel-c", _panel_input, _panel_shape_out, experiment="test-panel-shape")
 finally:
-    fuse_module.call_api = _orig_call_api_f
-with open(fuse_shape_path, encoding="utf-8") as f:
-    fuse_shape_rows = [json.loads(l) for l in f]
-check("eval.fuse doesn't crash when a call succeeds but returns a malformed/wrong-shape response",
-      len(fuse_shape_rows) == 3 and all(r.get("failed") is True for r in fuse_shape_rows))
-os.remove(fuse_shape_path)
-os.remove(fuse_out_path)
-os.remove(fuse_panel_path)
+    panel_module.call_api = _orig_call_api_panel
+_shape_rows = [json.loads(l) for l in open(_panel_shape_out, encoding="utf-8")]
+check("eval.panel doesn't crash on a malformed/wrong-shape 200 response, marks it failed instead",
+      len(_shape_rows) == 3 and all(r.get("failed") is True for r in _shape_rows))
+os.remove(_panel_shape_out)
 
-# --- 17. eval.baseline: independent of any panel/fusion file, accumulates
-#          across repeated calls into the same --out -------------------------
-baseline_out_path = os.path.join(_results_dir, "test_baseline_out.jsonl")
-baseline_module.run(base_url, ["baseline-a"], baseline_out_path, limit=3, experiment="test-baseline-a")
-with open(baseline_out_path, encoding="utf-8") as f:
-    baseline_rows1 = [json.loads(l) for l in f]
-check("eval.baseline writes one row per question, needs no panel/fusion file at all",
-      len(baseline_rows1) == 3 and all(r["schema"] == "0g.fusion_eval.gpqa.baselines.v1" for r in baseline_rows1))
-check("each row has exactly the 1 requested baseline model",
-      all([b["model"] for b in r["baselines"]] == ["baseline-a"] for r in baseline_rows1))
+_cli_panel_out = os.path.join(_results_dir, "test_panel_cli.jsonl")
+_r = _cli("eval.panel", "--model", "panel-cli", "--api-url", base_url, "--input", _panel_input,
+          "--out", _cli_panel_out, "--experiment", "test-panel-cli")
+check("the eval.panel CLI runs end to end", _r.returncode == 0)
+check("...output has the right row count", len(open(_cli_panel_out, encoding="utf-8").readlines()) == 3)
+os.remove(_cli_panel_out)
+os.remove(_panel_out)
 
-baseline_module.run(base_url, ["baseline-b"], baseline_out_path, limit=3, experiment="test-baseline-b")
-with open(baseline_out_path, encoding="utf-8") as f:
-    baseline_rows2 = [json.loads(l) for l in f]
-check("a 2nd eval.baseline call for a different model accumulates alongside the first, doesn't replace it",
-      all({b["model"] for b in r["baselines"]} == {"baseline-a", "baseline-b"} for r in baseline_rows2))
-
-_orig_call_api_b = baseline_module.call_api
-_bcalls = {"n": 0}
-
-
-def _counting_call_api_b(*a, **kw):
-    _bcalls["n"] += 1
-    return _orig_call_api_b(*a, **kw)
-
-
-baseline_module.call_api = _counting_call_api_b
-try:
-    stderr_b = io.StringIO()
-    with contextlib.redirect_stderr(stderr_b):
-        baseline_module.run(base_url, ["baseline-a", "baseline-b"], baseline_out_path, limit=3,
-                             experiment="test-baseline-resume")
-    check("re-running eval.baseline for models already present makes zero new calls", _bcalls["n"] == 0)
-    check("resume prints a clear skipped= message", "eval.baseline_resumed skipped=3" in stderr_b.getvalue())
-finally:
-    baseline_module.call_api = _orig_call_api_b
-
-# a previously-failed model entry must be retried, not permanently poisoned
-baseline_module.call_api = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("baseline down"))
-try:
-    with contextlib.redirect_stderr(io.StringIO()):
-        baseline_module.run(base_url, ["flaky"], baseline_out_path, limit=3, experiment="test-baseline-flaky")
-finally:
-    baseline_module.call_api = _orig_call_api_b
-with open(baseline_out_path, encoding="utf-8") as f:
-    flaky_rows = [json.loads(l) for l in f]
-check("a failed baseline model is recorded as failed, not silently dropped",
-      all(any(b["model"] == "flaky" and b.get("failed") for b in r["baselines"]) for r in flaky_rows))
-
-baseline_module.run(base_url, ["flaky"], baseline_out_path, limit=3, experiment="test-baseline-flaky-retry")
-with open(baseline_out_path, encoding="utf-8") as f:
-    flaky_retry_rows = [json.loads(l) for l in f]
-check("re-running eval.baseline for that model retries and replaces the failed entry",
-      all(any(b["model"] == "flaky" and not b.get("failed") for b in r["baselines"]) for r in flaky_retry_rows))
-check("...and the other 2 models are untouched",
-      all({"baseline-a", "baseline-b"} <= {b["model"] for b in r["baselines"]} for r in flaky_retry_rows))
-os.remove(baseline_out_path)
-
-# a call raising must not abort the run -- caught, marked failed, others continue
-_bfail_calls = {"n": 0}
-
-
-def _fail_2nd_baseline_call(url, model, msgs, **kw):
-    _bfail_calls["n"] += 1
-    if _bfail_calls["n"] == 2:
-        raise RuntimeError("simulated baseline failure for the 2nd question")
-    return _orig_call_api_b(url, model, msgs, **kw)
-
-
-baseline_fail_path = os.path.join(_results_dir, "test_baseline_fail.jsonl")
-baseline_module.call_api = _fail_2nd_baseline_call
-try:
-    baseline_module.run(base_url, ["baseline-c"], baseline_fail_path, limit=3, experiment="test-baseline-fail")
-finally:
-    baseline_module.call_api = _orig_call_api_b
-with open(baseline_fail_path, encoding="utf-8") as f:
-    baseline_fail_rows = [json.loads(l) for l in f]
-check("eval.baseline writes one row per question even when one question's call fails",
-      len(baseline_fail_rows) == 3)
-check("exactly one row's baseline entry is marked failed, the others succeeded",
-      sum(1 for r in baseline_fail_rows for b in r["baselines"] if b.get("failed")) == 1
-      and sum(1 for r in baseline_fail_rows for b in r["baselines"] if not b.get("failed")) == 2)
-os.remove(baseline_fail_path)
-
-# 200-but-wrong-shape must ALSO be caught (same try-block-scope lesson)
-def _malformed_shape_baseline(url, model, msgs, **kw):
-    return {"choices": []}
-
-
-baseline_shape_path = os.path.join(_results_dir, "test_baseline_shape.jsonl")
-baseline_module.call_api = _malformed_shape_baseline
-try:
-    baseline_module.run(base_url, ["shape-model"], baseline_shape_path, limit=2, experiment="test-baseline-shape")
-finally:
-    baseline_module.call_api = _orig_call_api_b
-with open(baseline_shape_path, encoding="utf-8") as f:
-    baseline_shape_rows = [json.loads(l) for l in f]
-check("eval.baseline doesn't crash on a malformed/wrong-shape response, marks that entry failed",
-      len(baseline_shape_rows) == 2
-      and all(any(b["model"] == "shape-model" and b.get("failed") for b in r["baselines"])
-              for r in baseline_shape_rows))
-os.remove(baseline_shape_path)
-
-# duplicate model names in --models must be deduped (exercised at the real CLI)
-dedupe_out = os.path.join(_results_dir, "test_baseline_dedupe.jsonl")
-_cli_dedupe = _cli("eval.baseline", "--baseline-url", base_url, "--models", " dup , dup ,other",
-                    "--out", dedupe_out, "--limit", "1", "--experiment", "test-baseline-dedupe")
-check("the eval.baseline CLI runs end to end and writes its --out", _cli_dedupe.returncode == 0)
-_dedupe_row = json.loads(open(dedupe_out, encoding="utf-8").readline())
-check("a repeated --models name is collapsed to one call, whitespace stripped, order kept",
-      [b["model"] for b in _dedupe_row["baselines"]] == ["dup", "other"])
-os.remove(dedupe_out)
-
-# --- 18. eval.grade: merges 1+ files by question_id before scoring ---------
-grade_fuse_path = os.path.join(_results_dir, "test_grade_fuse.jsonl")
-grade_panel_path = os.path.join(_results_dir, "test_grade_panel.jsonl")
-panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS), grade_panel_path, limit=3,
-                  experiment="test-grade-panel")
-fuse_module.run(base_url, "0g/fusion-preview", grade_panel_path, grade_fuse_path, experiment="test-grade-fuse")
-
-grade_baseline_path = os.path.join(_results_dir, "test_grade_baseline.jsonl")
-baseline_module.run(base_url, ["bl-x", "bl-y"], grade_baseline_path, limit=3, experiment="test-grade-baseline")
-
-single_result = grade_replay(grade_fuse_path)
-check("grade_replay on a single fuse file scores fusion, no baselines present",
-      single_result["fusion"]["n"] == 3 and single_result["baselines"] == {})
-
-merged_result = grade_replay(grade_fuse_path, grade_baseline_path)
-check("grade_replay merges a fuse file + a baseline file by question_id into one scoreboard",
-      merged_result["fusion"]["n"] == 3 and set(merged_result["baselines"]) == {"bl-x", "bl-y"}
-      and merged_result["baselines"]["bl-x"]["n"] == 3)
-
-merged_rows = load_rows([grade_fuse_path, grade_baseline_path])
-check("load_rows produces exactly one merged row per question_id, carrying both fusion and baselines",
-      len(merged_rows) == 3 and all("fusion" in r and "baselines" in r for r in merged_rows))
-
-_cli_grade = _cli("eval.grade", grade_fuse_path, grade_baseline_path)
-check("the eval.grade CLI accepts multiple files and runs end to end", _cli_grade.returncode == 0)
-check("the CLI's output matches grade_replay's own return value",
-      json.loads(_cli_grade.stdout) == merged_result)
-
-os.remove(grade_fuse_path)
-os.remove(grade_panel_path)
-os.remove(grade_baseline_path)
-
-# blank trailing line tolerance
-blank_path = os.path.join(_results_dir, "test_grade_blank.jsonl")
-with open(blank_path, "w", encoding="utf-8") as f:
-    f.write(json.dumps({"question_id": 0, "correct_letter": "A", "fusion": {"content": "Final Answer: A"}}) + "\n\n")
-check("grade_replay tolerates a blank trailing line", grade_replay(blank_path)["fusion"]["n"] == 1)
-os.remove(blank_path)
-
-# hand-computed scoring check across every row shape eval.fuse/eval.baseline
-# can emit, checked against hand-computed numbers -- not just "it didn't crash"
-shapes_path = os.path.join(_results_dir, "test_grade_shapes.jsonl")
-with open(shapes_path, "w", encoding="utf-8") as f:
-    for _r in (
-        {"question_id": 0, "correct_letter": "A", "fusion": {"content": "Final Answer: A"},
-         "baselines": [{"model": "A", "content": "Final Answer: A"}, {"model": "B", "content": "Final Answer: C"}]},
-        {"question_id": 1, "correct_letter": "B", "fusion": {"content": "Final Answer: B"},
-         "baselines": [{"model": "A", "content": "no letter here"}, {"model": "B", "failed": True, "error": "boom"}]},
-        {"question_id": 2, "correct_letter": "C", "failed": True, "error": "outage"},
-        {"question_id": 3, "correct_letter": "D", "fusion": {"content": "Final Answer: D"}, "baselines": []},
-    ):
-        f.write(json.dumps(_r) + "\n")
-shape_scores = grade_replay(shapes_path)
-check("grade_replay: fusion scores 3/4 with the row-level failure as call_failed",
-      shape_scores["fusion"] == {"accuracy": 0.75, "correct": 3, "extraction_failed": 0, "call_failed": 1,
-                                  "no_ground_truth": 0, "n": 4})
-check("grade_replay: baseline A = 1 correct, 1 unparseable, 2 rows it was never run for",
-      shape_scores["baselines"]["A"] == {"accuracy": 0.25, "correct": 1, "extraction_failed": 1, "call_failed": 2,
-                                          "no_ground_truth": 0, "n": 4})
-check("grade_replay: baseline B = answered once (wrong), failed/absent the other 3",
-      shape_scores["baselines"]["B"] == {"accuracy": 0.0, "correct": 0, "extraction_failed": 0, "call_failed": 3,
-                                          "no_ground_truth": 0, "n": 4})
-check("grade_replay lists exactly the models that appear in any baselines list",
-      sorted(shape_scores["baselines"]) == ["A", "B"])
-os.remove(shapes_path)
-
-# --- 19. resume-safety: refusing to reuse rows written against a DIFFERENT
-#          dataset/question set under the same --out (eval.panel, eval.baseline,
-#          and eval.fuse keyed off its --panel file's own question set) -----
-def _write_dataset(path, tag, n=3):
-    with open(path, "w", encoding="utf-8") as f:
-        for i in range(n):
-            f.write(json.dumps({"Question": f"{tag} question {i}", "Correct Answer": f"{tag}-right-{i}",
-                                 "Incorrect Answer 1": f"{tag}-w1-{i}", "Incorrect Answer 2": f"{tag}-w2-{i}",
-                                 "Incorrect Answer 3": f"{tag}-w3-{i}"}) + "\n")
-
-
-_safe_default = gpqa_tasks_module.REAL_DEFAULT_PATH  # the forced-sample default set up at the top of this file
-ds_a = os.path.join(_results_dir, "test_ds_a.jsonl")
-ds_b = os.path.join(_results_dir, "test_ds_b.jsonl")
-_write_dataset(ds_a, "DATASET-A")
-_write_dataset(ds_b, "DATASET-B")
-
-swap_panel_path = os.path.join(_results_dir, "test_swap_panel.jsonl")
-if os.path.exists(swap_panel_path):
-    os.remove(swap_panel_path)
-try:
-    gpqa_tasks_module.REAL_DEFAULT_PATH = ds_a
-    panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS), swap_panel_path, limit=3,
-                      experiment="test-swap")
-    with contextlib.redirect_stderr(io.StringIO()):
-        panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS), swap_panel_path, limit=3,
-                          experiment="test-swap")
-    check("resume across an UNCHANGED dataset is unaffected by the identity check",
-          sum(1 for _ in open(swap_panel_path, encoding="utf-8")) == 3)
-
-    gpqa_tasks_module.REAL_DEFAULT_PATH = ds_b
-    try:
-        panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS), swap_panel_path, limit=3,
-                          experiment="test-swap")
-        check("eval.panel refuses to resume rows written against a DIFFERENT dataset", False)
-    except ResumeMismatchError:
-        check("eval.panel refuses to resume rows written against a DIFFERENT dataset", True)
-    check("the mismatch aborts before --out is opened for writing, leaving the old rows intact",
-          all("DATASET-A" in json.loads(l)["instruction"] for l in open(swap_panel_path, encoding="utf-8")))
-
-    panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS), swap_panel_path, limit=3,
-                      experiment="test-swap", resume=False)
-    check("--no-resume is still the documented escape hatch and recomputes from scratch",
-          all("DATASET-B" in json.loads(l)["instruction"] for l in open(swap_panel_path, encoding="utf-8")))
-finally:
-    gpqa_tasks_module.REAL_DEFAULT_PATH = _safe_default
-os.remove(swap_panel_path)
-
-swap_baseline_path = os.path.join(_results_dir, "test_swap_baseline.jsonl")
-if os.path.exists(swap_baseline_path):
-    os.remove(swap_baseline_path)
-try:
-    gpqa_tasks_module.REAL_DEFAULT_PATH = ds_a
-    baseline_module.run(base_url, ["bl"], swap_baseline_path, limit=3, experiment="test-swap-bl")
-    gpqa_tasks_module.REAL_DEFAULT_PATH = ds_b
-    try:
-        baseline_module.run(base_url, ["bl"], swap_baseline_path, limit=3, experiment="test-swap-bl")
-        check("eval.baseline refuses to resume rows written against a DIFFERENT dataset", False)
-    except ResumeMismatchError:
-        check("eval.baseline refuses to resume rows written against a DIFFERENT dataset", True)
-finally:
-    gpqa_tasks_module.REAL_DEFAULT_PATH = _safe_default
-os.remove(swap_baseline_path)
-
-# eval.fuse doesn't call load_tasks at all -- its resume-safety is keyed off
-# the --panel FILE's own question set, so build two panels over different
-# question sets directly and swap the --panel file under the same --out
-fuse_swap_panel_a = os.path.join(_results_dir, "test_fuse_swap_a.jsonl")
-fuse_swap_panel_b = os.path.join(_results_dir, "test_fuse_swap_b.jsonl")
-try:
-    gpqa_tasks_module.REAL_DEFAULT_PATH = ds_a
-    panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS), fuse_swap_panel_a, limit=3,
-                      experiment="test-fuse-swap-a")
-    gpqa_tasks_module.REAL_DEFAULT_PATH = ds_b
-    panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS), fuse_swap_panel_b, limit=3,
-                      experiment="test-fuse-swap-b")
-finally:
-    gpqa_tasks_module.REAL_DEFAULT_PATH = _safe_default
-fuse_swap_out = os.path.join(_results_dir, "test_fuse_swap_out.jsonl")
-if os.path.exists(fuse_swap_out):
-    os.remove(fuse_swap_out)
-fuse_module.run(base_url, "0g/fusion-preview", fuse_swap_panel_a, fuse_swap_out, experiment="test-fuse-swap")
-try:
-    fuse_module.run(base_url, "0g/fusion-preview", fuse_swap_panel_b, fuse_swap_out, experiment="test-fuse-swap")
-    check("eval.fuse refuses to resume rows written against a different --panel file's questions", False)
-except ResumeMismatchError:
-    check("eval.fuse refuses to resume rows written against a different --panel file's questions", True)
-os.remove(fuse_swap_panel_a)
-os.remove(fuse_swap_panel_b)
-os.remove(fuse_swap_out)
-os.remove(ds_a)
-os.remove(ds_b)
-
-# --- 20. full command-chain smoke test via the actual CLIs (subprocess),
-#          exactly the sequence intended for a real run: build the fixed
-#          panel once, fuse it, build a --reuse variant panel, fuse that too,
-#          add baselines completely independently, grade fusion+baselines
-#          together -- and restate the cost guarantee at the CLI level -----
-cli_panel_out = os.path.join(_results_dir, "cli-panel-fixed.jsonl")
-r1 = _cli("eval.panel", "--fusion-url", base_url, "--models", ",".join(cfg.PANEL_MODELS),
-          "--out", cli_panel_out, "--limit", "2", "--experiment", "cli-panel-fixed")
-check("CLI: eval.panel runs end to end", r1.returncode == 0 and r1.stderr == "")
-
-cli_fuse_out = os.path.join(_results_dir, "cli-fuse-fixed.jsonl")
-r2 = _cli("eval.fuse", "--fusion-url", base_url, "--panel", cli_panel_out,
-          "--out", cli_fuse_out, "--experiment", "cli-fuse-fixed")
-check("CLI: eval.fuse runs end to end on the panel it just built", r2.returncode == 0)
-
-cli_variant_out = os.path.join(_results_dir, "cli-panel-variant.jsonl")
-r3 = _cli("eval.panel", "--fusion-url", base_url, "--models", ",".join(cfg.PANEL_MODELS) + ",candidate-cli",
-          "--reuse", cli_panel_out, "--out", cli_variant_out, "--limit", "2", "--experiment", "cli-panel-variant")
-check("CLI: eval.panel --reuse builds a variant panel end to end", r3.returncode == 0)
-with open(cli_variant_out, encoding="utf-8") as f:
-    cli_variant_rows = [json.loads(l) for l in f]
-check("CLI-built variant panel reused the fixed models and added the candidate",
-      all(len(r["panel"]) == len(cfg.PANEL_MODELS) + 1 for r in cli_variant_rows))
-
-cli_baseline_out = os.path.join(_results_dir, "cli-baselines.jsonl")
-r4 = _cli("eval.baseline", "--baseline-url", base_url, "--models", "gpt-baseline-cli,claude-baseline-cli",
-          "--out", cli_baseline_out, "--limit", "2", "--experiment", "cli-baselines")
-check("CLI: eval.baseline runs end to end, independent of any panel/fusion file", r4.returncode == 0)
-
-cli_variant_fuse_out = os.path.join(_results_dir, "cli-fuse-variant.jsonl")
-r5 = _cli("eval.fuse", "--fusion-url", base_url, "--panel", cli_variant_out,
-          "--out", cli_variant_fuse_out, "--experiment", "cli-fuse-variant")
-check("CLI: eval.fuse on the variant panel runs end to end", r5.returncode == 0)
-
-r6 = _cli("eval.grade", cli_variant_fuse_out, cli_baseline_out)
-check("CLI: eval.grade merges the variant's fusion result with the independent baselines", r6.returncode == 0)
-cli_grade_result = json.loads(r6.stdout)
-check("the merged CLI grade result has both the fusion score and both baseline models scored",
-      cli_grade_result["fusion"]["n"] == 2 and set(cli_grade_result["baselines"]) == {"gpt-baseline-cli", "claude-baseline-cli"})
-
-check("*** end-to-end via the real CLI: building/reusing panels made zero judge/synthesis calls ***",
-      glob.glob(os.path.join(llm_client.LOG_DIR, "cli-panel-fixed__judge__*")) == []
-      and glob.glob(os.path.join(llm_client.LOG_DIR, "cli-panel-fixed__synthesis__*")) == []
-      and glob.glob(os.path.join(llm_client.LOG_DIR, "cli-panel-variant__judge__*")) == []
-      and glob.glob(os.path.join(llm_client.LOG_DIR, "cli-panel-variant__synthesis__*")) == [])
-
-for f in glob.glob(os.path.join(llm_client.LOG_DIR, "cli-*")):
+for f in glob.glob(os.path.join(llm_client.LOG_DIR, "test-panel*")):
     os.remove(f)
-for p in (cli_panel_out, cli_fuse_out, cli_variant_out, cli_baseline_out, cli_variant_fuse_out):
+
+# --- 16. eval.baseline: same shape as eval.panel, role=baseline ------------
+from eval import baseline as baseline_module  # noqa: E402
+
+_baseline_out = os.path.join(_results_dir, "test_baseline_out.jsonl")
+baseline_module.run(base_url, "gpt-5.6-sol", _panel_input, _baseline_out, experiment="test-baseline-exp")
+_baseline_rows = [json.loads(l) for l in open(_baseline_out, encoding="utf-8")]
+check("eval.baseline writes exactly one row per input question", len(_baseline_rows) == 3)
+check("every row has the same shape as eval.panel's rows",
+      all({"question_id", "instruction", "correct_letter", "model", "content", "reasoning"} <= set(r)
+          for r in _baseline_rows))
+check("eval.baseline logs its calls under role=baseline",
+      os.path.exists(os.path.join(llm_client.LOG_DIR, "test-baseline-exp__baseline__gpt-5.6-sol.jsonl")))
+
+_orig_call_api_baseline = baseline_module.call_api
+
+
+def _fail_1st_baseline_call(url, model, msgs, **kw):
+    raise RuntimeError("simulated baseline failure")
+
+
+baseline_module.call_api = _fail_1st_baseline_call
+try:
+    _baseline_fail_out = os.path.join(_results_dir, "test_baseline_fail.jsonl")
+    baseline_module.run(base_url, "claude-fable-5", _panel_input, _baseline_fail_out, experiment="test-baseline-fail")
+finally:
+    baseline_module.call_api = _orig_call_api_baseline
+_baseline_fail_rows = [json.loads(l) for l in open(_baseline_fail_out, encoding="utf-8")]
+check("eval.baseline writes one row per question even when every call fails, doesn't abort",
+      len(_baseline_fail_rows) == 3 and all(r.get("failed") is True for r in _baseline_fail_rows))
+os.remove(_baseline_fail_out)
+
+_cli_baseline_out = os.path.join(_results_dir, "test_baseline_cli.jsonl")
+_r = _cli("eval.baseline", "--model", "baseline-cli", "--api-url", base_url, "--input", _panel_input,
+          "--out", _cli_baseline_out, "--experiment", "test-baseline-cli")
+check("the eval.baseline CLI runs end to end", _r.returncode == 0)
+check("...output has the right row count", len(open(_cli_baseline_out, encoding="utf-8").readlines()) == 3)
+os.remove(_cli_baseline_out)
+
+for f in glob.glob(os.path.join(llm_client.LOG_DIR, "test-baseline*")):
+    os.remove(f)
+os.remove(_baseline_out)
+
+# --- 17. eval.fuse: judge+synthesis over N already-built panel files -------
+from eval import fuse as fuse_module  # noqa: E402
+
+_panel_a_path = os.path.join(_results_dir, "fp_a.jsonl")
+_panel_b_path = os.path.join(_results_dir, "fp_b.jsonl")
+panel_module.run(base_url, "fuse-panel-a", _panel_input, _panel_a_path, experiment="test-fuse-panels")
+panel_module.run(base_url, "fuse-panel-b", _panel_input, _panel_b_path, experiment="test-fuse-panels")
+check("building the 2 panel files made zero judge/synthesis calls",
+      glob.glob(os.path.join(llm_client.LOG_DIR, "test-fuse-panels__judge__*")) == []
+      and glob.glob(os.path.join(llm_client.LOG_DIR, "test-fuse-panels__synthesis__*")) == [])
+for f in glob.glob(os.path.join(llm_client.LOG_DIR, "test-fuse-panels__*")):
+    os.remove(f)
+
+_fuse_out = os.path.join(_results_dir, "test_fuse_out.jsonl")
+fuse_module.run(base_url, "judge-x", "synthesis-y", _panel_input, [_panel_a_path, _panel_b_path], _fuse_out,
+                experiment="test-fuse-exp")
+_fuse_rows = [json.loads(l) for l in open(_fuse_out, encoding="utf-8")]
+check("eval.fuse writes one row per input question", len(_fuse_rows) == 3)
+check("every row has the fusion answer + judge_json + panel_models list",
+      all({"question_id", "instruction", "correct_letter", "judge_model", "synthesis_model",
+           "panel_models", "content", "reasoning", "judge_json"} <= set(r) for r in _fuse_rows))
+check("panel_models records exactly the models that were fused, in order",
+      all(r["panel_models"] == ["fuse-panel-a", "fuse-panel-b"] for r in _fuse_rows))
+check("*** eval.fuse makes zero fresh panel calls (only reads the already-built panel files) ***",
+      glob.glob(os.path.join(llm_client.LOG_DIR, "test-fuse-exp__panel__*")) == [])
+check("eval.fuse makes exactly the judge call",
+      len(glob.glob(os.path.join(llm_client.LOG_DIR, "test-fuse-exp__judge__*"))) == 1)
+check("eval.fuse makes exactly the synthesis call",
+      len(glob.glob(os.path.join(llm_client.LOG_DIR, "test-fuse-exp__synthesis__*"))) == 1)
+for f in glob.glob(os.path.join(llm_client.LOG_DIR, "test-fuse-exp__*")):
+    os.remove(f)
+
+# a question missing (or failed) in one panel file must be skipped -- marked
+# failed, naming which file was short -- not abort the run, and must cost
+# zero judge/synthesis calls for exactly that question
+_panel_b_rows = [json.loads(l) for l in open(_panel_b_path, encoding="utf-8")]
+_panel_b_missing_path = os.path.join(_results_dir, "fp_b_missing_q1.jsonl")
+with open(_panel_b_missing_path, "w", encoding="utf-8") as f:
+    for r in _panel_b_rows:
+        if r["question_id"] != 1:
+            f.write(json.dumps(r) + "\n")
+
+_orig_call_api_fuse = fuse_module.call_api
+_fcount = {"n": 0}
+
+
+def _counting_fuse_call(url, model, msgs, **kw):
+    _fcount["n"] += 1
+    return _orig_call_api_fuse(url, model, msgs, **kw)
+
+
+fuse_module.call_api = _counting_fuse_call
+try:
+    _fuse_missing_out = os.path.join(_results_dir, "test_fuse_missing.jsonl")
+    stderr_missing = io.StringIO()
+    with contextlib.redirect_stderr(stderr_missing):
+        fuse_module.run(base_url, "judge-x", "synthesis-y", _panel_input, [_panel_a_path, _panel_b_missing_path],
+                         _fuse_missing_out, experiment="test-fuse-missing")
+    check("only 2 questions' worth of judge+synthesis calls were made (2 questions x 2 calls = 4), "
+          "not 3 x 2 = 6 -- the missing question cost nothing", _fcount["n"] == 4)
+finally:
+    fuse_module.call_api = _orig_call_api_fuse
+_missing_rows = [json.loads(l) for l in open(_fuse_missing_out, encoding="utf-8")]
+check("eval.fuse writes one row per question even when a panel file is missing one",
+      len(_missing_rows) == 3)
+check("the question missing from a panel file is marked failed, naming which file was short",
+      _missing_rows[1].get("failed") is True and "fp_b_missing_q1.jsonl" in _missing_rows[1].get("error", ""))
+check("the other 2 questions fused normally", "failed" not in _missing_rows[0] and "failed" not in _missing_rows[2])
+check("eval.fuse prints a clear skip message naming the question_id",
+      "eval.fuse_question_skipped" in stderr_missing.getvalue())
+os.remove(_panel_b_missing_path)
+os.remove(_fuse_missing_out)
+for f in glob.glob(os.path.join(llm_client.LOG_DIR, "test-fuse-missing__*")):
+    os.remove(f)
+
+# JUDGE_MODELS_WITHOUT_JSON_MODE quirk must still be honored (0g-router hard-
+# rejects response_format for a judge model that doesn't advertise it)
+_seen_json_mode_fuse = {}
+
+
+def _capture_json_mode_fuse(url, model, msgs, **kw):
+    if "json_mode" in kw:
+        _seen_json_mode_fuse["value"] = kw["json_mode"]
+    return _orig_call_api_fuse(url, model, msgs, **kw)
+
+
+fuse_module.call_api = _capture_json_mode_fuse
+try:
+    fuse_module.run(base_url, "minimax-m3", "synthesis-y", _panel_input, [_panel_a_path, _panel_b_path],
+                     _fuse_out, experiment="test-fuse-jsonmode")
+    check("eval.fuse withholds json_mode for a judge model in JUDGE_MODELS_WITHOUT_JSON_MODE",
+          _seen_json_mode_fuse.get("value") is False)
+finally:
+    fuse_module.call_api = _orig_call_api_fuse
+os.remove(_fuse_out)
+for f in glob.glob(os.path.join(llm_client.LOG_DIR, "test-fuse-jsonmode__*")):
+    os.remove(f)
+
+# judge succeeding but synthesis failing must still mark the question failed
+# cleanly, not crash the run (the call+row-construction try-block-scope lesson)
+def _synthesis_fails(url, model, msgs, **kw):
+    if model == "synthesis-y":
+        raise RuntimeError("simulated synthesis failure")
+    return _orig_call_api_fuse(url, model, msgs, **kw)
+
+
+fuse_module.call_api = _synthesis_fails
+try:
+    _fuse_synthfail_out = os.path.join(_results_dir, "test_fuse_synthfail.jsonl")
+    fuse_module.run(base_url, "judge-x", "synthesis-y", _panel_input, [_panel_a_path, _panel_b_path],
+                     _fuse_synthfail_out, experiment="test-fuse-synthfail")
+finally:
+    fuse_module.call_api = _orig_call_api_fuse
+_synthfail_rows = [json.loads(l) for l in open(_fuse_synthfail_out, encoding="utf-8")]
+check("eval.fuse marks a question failed if synthesis fails (even though judge succeeded first), "
+      "doesn't crash the run",
+      len(_synthfail_rows) == 3
+      and all(r.get("failed") is True and "simulated synthesis failure" in r.get("error", "")
+              for r in _synthfail_rows))
+os.remove(_fuse_synthfail_out)
+for f in glob.glob(os.path.join(llm_client.LOG_DIR, "test-fuse-synthfail__*")):
+    os.remove(f)
+
+# a malformed judge JSON must warn but not abort the run (minimax-m3 as judge
+# with json_mode withheld -- FAKE mode's non-JSON text for it)
+stderr_judge_invalid = io.StringIO()
+with contextlib.redirect_stderr(stderr_judge_invalid):
+    fuse_module.run(base_url, "minimax-m3", "kimi-k3", _panel_input, [_panel_a_path, _panel_b_path],
+                     _fuse_out, experiment="test-fuse-judgeinvalid")
+check("a malformed judge JSON prints a clear warning naming the question and judge model, "
+      "and does not abort the run",
+      "eval.fuse_judge_json_invalid" in stderr_judge_invalid.getvalue()
+      and "judge_model='minimax-m3'" in stderr_judge_invalid.getvalue())
+_judgeinvalid_rows = [json.loads(l) for l in open(_fuse_out, encoding="utf-8")]
+check("...and every question still fused successfully despite the warning",
+      len(_judgeinvalid_rows) == 3 and all("failed" not in r for r in _judgeinvalid_rows))
+os.remove(_fuse_out)
+for f in glob.glob(os.path.join(llm_client.LOG_DIR, "test-fuse-judgeinvalid__*")):
+    os.remove(f)
+
+_cli_fuse_out = os.path.join(_results_dir, "test_fuse_cli.jsonl")
+_r = _cli("eval.fuse", "--judge-model", "judge-x", "--synthesis-model", "synthesis-y", "--api-url", base_url,
+          "--input", _panel_input, "--panels", f"{_panel_a_path},{_panel_b_path}", "--out", _cli_fuse_out,
+          "--experiment", "test-fuse-cli")
+check("the eval.fuse CLI runs end to end", _r.returncode == 0)
+check("...output has the right row count", len(open(_cli_fuse_out, encoding="utf-8").readlines()) == 3)
+os.remove(_cli_fuse_out)
+for f in glob.glob(os.path.join(llm_client.LOG_DIR, "test-fuse-cli__*")):
+    os.remove(f)
+
+os.remove(_panel_a_path)
+os.remove(_panel_b_path)
+
+# --- 18. eval.grade: scores each given file independently, never merges ----
+_grade_path = os.path.join(_results_dir, "test_grade_shapes.jsonl")
+with open(_grade_path, "w", encoding="utf-8") as f:
+    for r in (
+        {"question_id": 0, "correct_letter": "A", "content": "Final Answer: A"},     # correct
+        {"question_id": 1, "correct_letter": "B", "content": "Final Answer: C"},     # wrong
+        {"question_id": 2, "correct_letter": "A", "content": "no letter here"},      # extraction_failed
+        {"question_id": 3, "correct_letter": "A", "failed": True, "error": "boom"},  # call_failed
+        {"question_id": 4, "content": "Final Answer: A"},                            # no_ground_truth
+    ):
+        f.write(json.dumps(r) + "\n")
+_grade_result = grade_file(_grade_path)
+check("grade_file: hand-computed scoring across every row shape",
+      _grade_result == {"accuracy": 0.2, "correct": 1, "extraction_failed": 1, "call_failed": 1,
+                         "no_ground_truth": 1, "duplicate_question_ids": 0, "n": 5})
+os.remove(_grade_path)
+
+_grade_path_a = os.path.join(_results_dir, "test_grade_a.jsonl")
+_grade_path_b = os.path.join(_results_dir, "test_grade_b.jsonl")
+with open(_grade_path_a, "w", encoding="utf-8") as f:
+    f.write(json.dumps({"question_id": 0, "correct_letter": "A", "content": "Final Answer: A"}) + "\n")
+with open(_grade_path_b, "w", encoding="utf-8") as f:
+    f.write(json.dumps({"question_id": 0, "correct_letter": "Z", "content": "Final Answer: Q"}) + "\n")
+_result_a = grade_file(_grade_path_a)
+_result_b = grade_file(_grade_path_b)
+check("grading two files that disagree about question_id 0 causes no error and no interaction -- "
+      "each file's own score is exactly its own, because nothing ever merges them",
+      _result_a["accuracy"] == 1.0 and _result_b["accuracy"] == 0.0)
+
+_r = _cli("eval.grade", _grade_path_a, _grade_path_b)
+check("the eval.grade CLI accepts multiple files and runs end to end", _r.returncode == 0)
+_cli_grade_result = json.loads(_r.stdout)
+check("the CLI reports each file's score separately, keyed by its own path",
+      set(_cli_grade_result) == {_grade_path_a, _grade_path_b}
+      and _cli_grade_result[_grade_path_a]["accuracy"] == 1.0
+      and _cli_grade_result[_grade_path_b]["accuracy"] == 0.0)
+os.remove(_grade_path_a)
+os.remove(_grade_path_b)
+
+_r = _cli("eval.grade")
+check("the eval.grade CLI rejects being run with no files at all", _r.returncode != 0)
+
+os.remove(_panel_input)
+
+# --- 19. full workflow, end to end: sample -> panel (x2 models) -> fuse ->
+#          baseline -> grade, then extend with "sample the rest, merge" -----
+_e2e_sample1 = os.path.join(_results_dir, "test_e2e_sample_0-2.jsonl")
+sample_run(SAMPLE_PATH, [0, 1, 2], _e2e_sample1)
+
+_e2e_panel1 = os.path.join(_results_dir, "test_e2e_panel_m1.jsonl")
+_e2e_panel2 = os.path.join(_results_dir, "test_e2e_panel_m2.jsonl")
+panel_module.run(base_url, "e2e-m1", _e2e_sample1, _e2e_panel1, experiment="test-e2e")
+panel_module.run(base_url, "e2e-m2", _e2e_sample1, _e2e_panel2, experiment="test-e2e")
+check("end-to-end: building 2 panel files made zero judge/synthesis calls",
+      glob.glob(os.path.join(llm_client.LOG_DIR, "test-e2e__judge__*")) == []
+      and glob.glob(os.path.join(llm_client.LOG_DIR, "test-e2e__synthesis__*")) == [])
+
+_e2e_fuse = os.path.join(_results_dir, "test_e2e_fuse.jsonl")
+fuse_module.run(base_url, "e2e-judge", "e2e-synth", _e2e_sample1, [_e2e_panel1, _e2e_panel2], _e2e_fuse,
+                 experiment="test-e2e")
+check("end-to-end: fuse made exactly 1 judge-log and 1 synthesis-log file, 3 lines each "
+      "(one per question, no more)",
+      len(open(os.path.join(llm_client.LOG_DIR, "test-e2e__judge__e2e-judge.jsonl"), encoding="utf-8")
+          .readlines()) == 3
+      and len(open(os.path.join(llm_client.LOG_DIR, "test-e2e__synthesis__e2e-synth.jsonl"), encoding="utf-8")
+              .readlines()) == 3)
+
+_e2e_baseline = os.path.join(_results_dir, "test_e2e_baseline.jsonl")
+baseline_module.run(base_url, "e2e-baseline", _e2e_sample1, _e2e_baseline, experiment="test-e2e")
+
+check("end-to-end: fuse result over the 3-question sample grades cleanly", grade_file(_e2e_fuse)["n"] == 3)
+
+for f in glob.glob(os.path.join(llm_client.LOG_DIR, "test-e2e__*")):
+    os.remove(f)
+
+# sample the REMAINING 2 questions, run the same model over them, then merge
+# the two output files by plain concatenation -- exactly the workflow this
+# whole redesign exists to support
+_e2e_sample2 = os.path.join(_results_dir, "test_e2e_sample_3-4.jsonl")
+sample_run(SAMPLE_PATH, [3, 4], _e2e_sample2)
+_e2e_panel1_rest = os.path.join(_results_dir, "test_e2e_panel_m1_rest.jsonl")
+panel_module.run(base_url, "e2e-m1", _e2e_sample2, _e2e_panel1_rest, experiment="test-e2e-rest")
+
+_e2e_panel1_merged = os.path.join(_results_dir, "test_e2e_panel_m1_merged.jsonl")
+with open(_e2e_panel1_merged, "w", encoding="utf-8") as out_f:
+    for path in (_e2e_panel1, _e2e_panel1_rest):
+        with open(path, encoding="utf-8") as in_f:
+            out_f.write(in_f.read())
+_merged_rows = [json.loads(l) for l in open(_e2e_panel1_merged, encoding="utf-8")]
+check("merging a first-batch panel file with a later 'rest of the questions' panel file (plain "
+      "concatenation) produces exactly the 5 original questions, each with the right question_id, "
+      "no collisions",
+      sorted(r["question_id"] for r in _merged_rows) == [0, 1, 2, 3, 4])
+
+for f in glob.glob(os.path.join(llm_client.LOG_DIR, "test-e2e-rest__*")):
+    os.remove(f)
+for p in (_e2e_sample1, _e2e_sample2, _e2e_panel1, _e2e_panel2, _e2e_fuse, _e2e_baseline,
+          _e2e_panel1_rest, _e2e_panel1_merged):
     os.remove(p)
 
-# --- 21. regressions found in the adversarial review of this redesign ------
+# --- 20. regressions found in the 4th independent review round -----------
 
-# 21a. eval.grade must refuse to merge two files that disagree about what a
-#      shared question_id actually IS -- otherwise the score depends on
-#      argument ORDER (whichever file is seen last wins the dict-merge).
-from eval.grade import GradeMergeError  # noqa: E402
+# 20a. --out's directory must be created if it doesn't exist yet --
+#      eval/samples/ and eval/results/ are both gitignored, so neither
+#      exists on a fresh clone; a bare open() used to fail before writing
+#      anything, on the very first documented command.
+_json_input = os.path.join(_results_dir, "test_json_input.jsonl")
+sample_run(SAMPLE_PATH, [0], _json_input)
 
-_conflict_a = os.path.join(_results_dir, "test_conflict_a.jsonl")
-_conflict_b = os.path.join(_results_dir, "test_conflict_b.jsonl")
-with open(_conflict_a, "w", encoding="utf-8") as f:
-    f.write(json.dumps({"question_id": 0, "instruction": "question A", "correct_letter": "A",
-                         "fusion": {"content": "Final Answer: A"}}) + "\n")
-with open(_conflict_b, "w", encoding="utf-8") as f:
-    f.write(json.dumps({"question_id": 0, "instruction": "a completely different question",
-                         "correct_letter": "B", "baselines": [{"model": "x", "content": "Final Answer: B"}]}) + "\n")
-for _order in ((_conflict_a, _conflict_b), (_conflict_b, _conflict_a)):
-    try:
-        grade_replay(*_order)
-        check(f"eval.grade refuses to merge files that disagree on question_id 0 (order={_order})", False)
-    except GradeMergeError:
-        check(f"eval.grade refuses to merge files that disagree on question_id 0 (order={_order})", True)
-# a row-level failure with no `instruction` at all carries no ground truth to
-# conflict with -- must NOT be flagged as a false-positive conflict
-_conflict_c = os.path.join(_results_dir, "test_conflict_c.jsonl")
-with open(_conflict_c, "w", encoding="utf-8") as f:
-    f.write(json.dumps({"question_id": 0, "correct_letter": "A", "failed": True, "error": "outage"}) + "\n")
-check("a row-level failure (no instruction) merges fine alongside a real row for the same question_id",
-      grade_replay(_conflict_a, _conflict_c)["fusion"]["n"] == 1)
-for _p in (_conflict_a, _conflict_b, _conflict_c):
-    os.remove(_p)
+_nodir_sample = os.path.join(_results_dir, "nodir_a", "out.jsonl")
+sample_run(SAMPLE_PATH, [0], _nodir_sample)
+check("eval.sample creates --out's directory if it doesn't exist yet", os.path.exists(_nodir_sample))
+shutil.rmtree(os.path.dirname(_nodir_sample))
 
-# 21b. schema guard: pointing --out (or eval.panel's --reuse) at a file
-#      written by a DIFFERENT tool must refuse, not silently rebuild the row
-#      and drop whatever that other tool already paid for.
-_schema_src = os.path.join(_results_dir, "test_schema_src.jsonl")
-panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS), _schema_src, limit=2,
-                  experiment="test-schema-src")
+_nodir_panel = os.path.join(_results_dir, "nodir_b", "out.jsonl")
+panel_module.run(base_url, "m", _json_input, _nodir_panel)
+check("eval.panel creates --out's directory if it doesn't exist yet", os.path.exists(_nodir_panel))
+shutil.rmtree(os.path.dirname(_nodir_panel))
 
-_schema_baseline_out = os.path.join(_results_dir, "test_schema_baseline.jsonl")
-import shutil as _shutil  # noqa: E402
-_shutil.copy(_schema_src, _schema_baseline_out)
+_nodir_baseline = os.path.join(_results_dir, "nodir_c", "out.jsonl")
+baseline_module.run(base_url, "m", _json_input, _nodir_baseline)
+check("eval.baseline creates --out's directory if it doesn't exist yet", os.path.exists(_nodir_baseline))
+shutil.rmtree(os.path.dirname(_nodir_baseline))
+
+_json_panel_a = os.path.join(_results_dir, "test_json_panel_a.jsonl")
+_json_panel_b = os.path.join(_results_dir, "test_json_panel_b.jsonl")
+panel_module.run(base_url, "json-panel-a", _json_input, _json_panel_a, experiment="test-json-mode-panels")
+panel_module.run(base_url, "json-panel-b", _json_input, _json_panel_b, experiment="test-json-mode-panels")
+
+_nodir_fuse = os.path.join(_results_dir, "nodir_d", "out.jsonl")
+fuse_module.run(base_url, "judge-x", "synth-x", _json_input, [_json_panel_a, _json_panel_b], _nodir_fuse)
+check("eval.fuse creates --out's directory if it doesn't exist yet", os.path.exists(_nodir_fuse))
+shutil.rmtree(os.path.dirname(_nodir_fuse))
+for f in glob.glob(os.path.join(llm_client.LOG_DIR, "test-json-mode-panels__*")):
+    os.remove(f)
+
+# 20b. json_mode must actually reach the real upstream call through the
+#      plain passthrough -- it used to be silently dropped by
+#      handle_chat_completion (which forwarded reasoning_effort/role but not
+#      json_mode), so the judge NEVER got JSON mode regardless of model,
+#      making JUDGE_MODELS_WITHOUT_JSON_MODE's whole purpose moot on every
+#      paid run. Checking the call_api() call-site kwarg alone (as an
+#      earlier test did) can't catch this -- the drop happens one hop
+#      further downstream, inside the server.
+_json_fuse_out = os.path.join(_results_dir, "test_json_fuse_out.jsonl")
+stderr_json = io.StringIO()
+with contextlib.redirect_stderr(stderr_json):
+    fuse_module.run(base_url, "judge-supports-json-mode", "synth-x", _json_input, [_json_panel_a, _json_panel_b],
+                     _json_fuse_out, experiment="test-json-mode")
+check("json_mode reaches the real upstream call -- a judge model NOT in "
+      "JUDGE_MODELS_WITHOUT_JSON_MODE gets a clean JSON response with no 'invalid' warning",
+      "eval.fuse_judge_json_invalid" not in stderr_json.getvalue())
+_json_row = json.loads(open(_json_fuse_out, encoding="utf-8").readline())
+check("...and judge_json is actually FAKE mode's json_mode response shape, proving json_mode "
+      "reached llm_client._fake_llm itself, not just the call_api() call site",
+      json.loads(_json_row["judge_json"]).get("consensus") == "panel members broadly agree")
+os.remove(_json_fuse_out)
+for f in glob.glob(os.path.join(llm_client.LOG_DIR, "test-json-mode__*")):
+    os.remove(f)
+
+# 20c. --panels listing the same file twice must be refused before any
+#      calls -- it would double-weight that panel member's vote in
+#      judge/synthesis and bill for it once per occurrence.
+_dup_panels_out = os.path.join(_results_dir, "test_dup_panels_out.jsonl")
 try:
-    baseline_module.run(base_url, ["some-model"], _schema_baseline_out, limit=2, experiment="test-schema-b")
-    check("eval.baseline refuses to reuse an --out written by eval.panel (different schema)", False)
-except ResumeMismatchError:
-    check("eval.baseline refuses to reuse an --out written by eval.panel (different schema)", True)
-os.remove(_schema_baseline_out)
-
-_schema_fuse_out = os.path.join(_results_dir, "test_schema_fuse.jsonl")
-baseline_module.run(base_url, ["some-model"], _schema_fuse_out, limit=2, experiment="test-schema-f")
-try:
-    fuse_module.run(base_url, "0g/fusion-preview", _schema_src, _schema_fuse_out, experiment="test-schema-f2")
-    check("eval.fuse refuses to reuse an --out written by eval.baseline (different schema)", False)
-except ResumeMismatchError:
-    check("eval.fuse refuses to reuse an --out written by eval.baseline (different schema)", True)
-os.remove(_schema_fuse_out)
-
-# the self-referential case: fuse.py's own --out pointed at a --panel-shaped
-# file (e.g. --experiment accidentally collides with the panel's own name)
-_schema_selffuse = os.path.join(_results_dir, "test_schema_selffuse.jsonl")
-_shutil.copy(_schema_src, _schema_selffuse)
-try:
-    fuse_module.run(base_url, "0g/fusion-preview", _schema_src, _schema_selffuse, experiment="test-schema-self")
-    check("eval.fuse refuses to treat a --panel-shaped --out as already-fused", False)
-except ResumeMismatchError:
-    check("eval.fuse refuses to treat a --panel-shaped --out as already-fused", True)
-os.remove(_schema_selffuse)
-
-_schema_panel_out = os.path.join(_results_dir, "test_schema_panel.jsonl")
-baseline_module.run(base_url, ["some-model"], _schema_panel_out, limit=2, experiment="test-schema-p")
-try:
-    panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS), _schema_panel_out, limit=2,
-                      experiment="test-schema-p2")
-    check("eval.panel refuses to reuse an --out written by eval.baseline (different schema)", False)
-except ResumeMismatchError:
-    check("eval.panel refuses to reuse an --out written by eval.baseline (different schema)", True)
-try:
-    panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS), _schema_src, limit=2,
-                      experiment="test-schema-p3", reuse_path=_schema_panel_out)
-    check("eval.panel's --reuse refuses a file written by eval.baseline (different schema)", False)
-except ResumeMismatchError:
-    check("eval.panel's --reuse refuses a file written by eval.baseline (different schema)", True)
-os.remove(_schema_panel_out)
-os.remove(_schema_src)
-
-# 21c. eval.fuse must carry forward rows outside the CURRENT --panel file's
-#      question set even with no --limit -- that window can shrink for
-#      reasons that have nothing to do with --limit (an interrupted
-#      eval.panel run, a hand-edited/concatenated panel file).
-_shrink_panel = os.path.join(_results_dir, "test_shrink_panel.jsonl")
-panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS), _shrink_panel, limit=3,
-                  experiment="test-shrink-panel")
-_shrink_fuse = os.path.join(_results_dir, "test_shrink_fuse.jsonl")
-fuse_module.run(base_url, "0g/fusion-preview", _shrink_panel, _shrink_fuse, experiment="test-shrink-fuse")
-check("all 3 rows fused before the panel file shrinks", sum(1 for _ in open(_shrink_fuse, encoding="utf-8")) == 3)
-with open(_shrink_panel, encoding="utf-8") as f:
-    _first_row_only = f.readline()
-with open(_shrink_panel, "w", encoding="utf-8") as f:
-    f.write(_first_row_only)  # simulate an interrupted/hand-edited panel file: 3 rows -> 1
-fuse_module.run(base_url, "0g/fusion-preview", _shrink_panel, _shrink_fuse, experiment="test-shrink-fuse")
-check("re-running eval.fuse against a SHRUNK --panel file, with no --limit, keeps the other "
-      "already-paid fusion rows instead of deleting them",
-      sum(1 for _ in open(_shrink_fuse, encoding="utf-8")) == 3)
-os.remove(_shrink_panel)
-os.remove(_shrink_fuse)
-
-# 21d. eval.panel's --reuse must hard-fail on a path that doesn't exist,
-#      instead of silently treating it as empty and re-calling everything.
-_missing_reuse = os.path.join(_results_dir, "does_not_exist_reuse.jsonl")
-_reuse_fail_out = os.path.join(_results_dir, "test_reuse_missing.jsonl")
-try:
-    panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS), _reuse_fail_out, limit=2,
-                      experiment="test-reuse-missing", reuse_path=_missing_reuse)
-    check("eval.panel --reuse raises on a nonexistent path instead of silently re-calling everything", False)
-except FileNotFoundError:
-    check("eval.panel --reuse raises on a nonexistent path instead of silently re-calling everything", True)
-check("...and nothing was called before the check failed", not os.path.exists(_reuse_fail_out))
-
-# 21e. eval.panel's --models must dedupe (matches eval.baseline's existing
-#      behavior) -- a repeated model name must be called once, not twice,
-#      and must not double-weight that model's vote in judge/synthesis.
-_dedupe_panel_out = os.path.join(_results_dir, "test_panel_dedupe.jsonl")
-_cli_panel_dedupe = _cli("eval.panel", "--fusion-url", base_url, "--models", " dup-panel , dup-panel ,other-panel",
-                          "--out", _dedupe_panel_out, "--limit", "1", "--experiment", "test-panel-dedupe")
-check("the eval.panel CLI runs end to end", _cli_panel_dedupe.returncode == 0)
-_dedupe_panel_row = json.loads(open(_dedupe_panel_out, encoding="utf-8").readline())
-check("a repeated --models name is collapsed to one call, whitespace stripped, order kept",
-      [p["model"] for p in _dedupe_panel_row["panel"]] == ["dup-panel", "other-panel"])
-os.remove(_dedupe_panel_out)
-
-# eval.panel/eval.baseline must reject an empty --models instead of silently
-# "succeeding" with 0 models and a misleading "already had everything" message
-for _mod_name in ("eval.panel", "eval.baseline"):
-    _empty_out = os.path.join(_results_dir, "test_empty_models.jsonl")
-    _flag = "--models"
-    _url_flag = "--fusion-url" if _mod_name == "eval.panel" else "--baseline-url"
-    _r = _cli(_mod_name, _url_flag, base_url, _flag, "", "--out", _empty_out, "--limit", "1")
-    check(f"{_mod_name} CLI rejects an empty --models instead of silently succeeding with 0 models",
-          _r.returncode != 0 and not os.path.exists(_empty_out))
-
-# 21f. the unified "everything already cached" skip branch: (1) a previously
-#      FAILED row still carries whatever was already cached BEFORE that
-#      failing call (not thrown away), so a retry doesn't re-pay for it;
-#      (2) a row with EXTRA members beyond the current --models gets trimmed
-#      to exactly --models, not kept verbatim; (3) a row that's now fully
-#      covered never carries a stale "failed": true forward.
-#      (Note: a single call batching several NEW models together is still
-#      all-or-nothing if one of them fails -- that failure mode lives in
-#      pipeline.run_panel's ThreadPoolExecutor, not in eval.panel, and isn't
-#      addressed here. What IS fixed: members cached from an EARLIER run/
-#      --reuse must survive a LATER call's failure, instead of being
-#      silently dropped from the row alongside it.)
-_retry_panel_path = os.path.join(_results_dir, "test_panel_retry_cached.jsonl")
-panel_module.run(base_url, "0g/fusion-preview", ["good-member"], _retry_panel_path, limit=1,
-                  experiment="test-retry-cached")
-
-
-def _fail_one_model(url, model, msgs, **kw):
-    if "flaky-member" in (kw.get("extra_panel_models") or []):
-        raise RuntimeError("simulated flaky-member failure")
-    return _orig_call_api_p(url, model, msgs, **kw)
-
-
-panel_module.call_api = _fail_one_model
-try:
-    panel_module.run(base_url, "0g/fusion-preview", ["good-member", "flaky-member"], _retry_panel_path,
-                      limit=1, experiment="test-retry-cached")
-finally:
-    panel_module.call_api = _orig_call_api_p
-with open(_retry_panel_path, encoding="utf-8") as f:
-    _first_fail_row = json.loads(f.readline())
-check("a batch failure's row still carries the member that was ALREADY cached before this call, "
-      "not just the error",
-      _first_fail_row.get("failed") is True
-      and [p["model"] for p in _first_fail_row.get("panel", [])] == ["good-member"])
-
-_pcalls["n"] = 0
-panel_module.call_api = _counting_call_api_p
-try:
-    panel_module.run(base_url, "0g/fusion-preview", ["good-member", "flaky-member"], _retry_panel_path,
-                      limit=1, experiment="test-retry-cached")
-    check("retrying only re-calls the model that actually failed, not the one already cached",
-          _pcalls["n"] == 1)
-finally:
-    panel_module.call_api = _orig_call_api_p
-with open(_retry_panel_path, encoding="utf-8") as f:
-    _retried_row = json.loads(f.readline())
-check("after a successful retry, the row is no longer marked failed and has both members",
-      "failed" not in _retried_row and {p["model"] for p in _retried_row["panel"]} == {"good-member", "flaky-member"})
-
-# now ask for a SMALLER panel than what's already cached (extra member from
-# an earlier request) -- must trim to exactly --models, not keep the extra
-panel_module.run(base_url, "0g/fusion-preview", ["good-member"], _retry_panel_path, limit=1,
-                  experiment="test-retry-cached")
-with open(_retry_panel_path, encoding="utf-8") as f:
-    _trimmed_row = json.loads(f.readline())
-check("requesting a SMALLER --models than what's cached trims the row to exactly --models "
-      "(never silently keeps a stale extra member)",
-      [p["model"] for p in _trimmed_row["panel"]] == ["good-member"] and "failed" not in _trimmed_row)
-os.remove(_retry_panel_path)
-
-# 21g. eval.fuse must refuse a --panel file with duplicate question_ids
-#      instead of silently paying for judge+synthesis twice for that question.
-_dup_qid_panel = os.path.join(_results_dir, "test_dup_qid_panel.jsonl")
-panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS), _dup_qid_panel, limit=2,
-                  experiment="test-dup-qid-panel")
-with open(_dup_qid_panel, encoding="utf-8") as f:
-    _dup_qid_rows = [json.loads(l) for l in f]
-with open(_dup_qid_panel, "w", encoding="utf-8") as f:
-    for r in _dup_qid_rows + [_dup_qid_rows[0]]:  # duplicate question_id 0
-        f.write(json.dumps(r) + "\n")
-_dup_qid_fuse_out = os.path.join(_results_dir, "test_dup_qid_fuse.jsonl")
-try:
-    fuse_module.run(base_url, "0g/fusion-preview", _dup_qid_panel, _dup_qid_fuse_out, experiment="test-dup-qid-fuse")
-    check("eval.fuse refuses a --panel file with a duplicate question_id", False)
+    fuse_module.run(base_url, "judge-x", "synth-x", _json_input, [_json_panel_a, _json_panel_a], _dup_panels_out)
+    check("eval.fuse refuses --panels listing the same file more than once", False)
 except ValueError as e:
-    check("eval.fuse refuses a --panel file with a duplicate question_id", "duplicate question_id" in str(e))
-check("...and nothing was called before the check failed", not os.path.exists(_dup_qid_fuse_out))
-os.remove(_dup_qid_panel)
+    check("eval.fuse refuses --panels listing the same file more than once", _json_panel_a in str(e))
+check("...and --out was never created", not os.path.exists(_dup_panels_out))
 
-# 21h. a --panel row missing correct_letter (but with everything else) must
-#      NOT crash even when the call SUCCEEDS -- it's ungradeable, not a call
-#      failure, so eval.fuse must write it through normally (with
-#      correct_letter: null) and let eval.grade's no_ground_truth bucket
-#      flag it, instead of the row itself pretending nothing's wrong.
-_no_letter_panel_path = os.path.join(_results_dir, "test_no_letter_panel.jsonl")
-with open(_no_letter_panel_path, "w", encoding="utf-8") as f:
-    f.write(json.dumps({"schema": panel_module.SCHEMA, "question_id": 0, "instruction": "Q?",
-                         # correct_letter deliberately missing
-                         "panel": [{"model": m, "content": "x", "reasoning": "y"} for m in cfg.PANEL_MODELS]}) + "\n")
-_no_letter_fuse_out = os.path.join(_results_dir, "test_no_letter_fuse_out.jsonl")
-fuse_module.run(base_url, "0g/fusion-preview", _no_letter_panel_path, _no_letter_fuse_out,
-                experiment="test-no-letter-row")
-with open(_no_letter_fuse_out, encoding="utf-8") as f:
-    _no_letter_rows = [json.loads(l) for l in f]
-check("a panel row missing correct_letter fuses successfully (not a call failure), correct_letter stays null",
-      len(_no_letter_rows) == 1 and "failed" not in _no_letter_rows[0]
-      and _no_letter_rows[0]["correct_letter"] is None and _no_letter_rows[0]["fusion"]["content"])
-os.remove(_no_letter_panel_path)
-os.remove(_no_letter_fuse_out)
+# 20d. a panel row that disagrees with --input about what the question even
+#      IS (e.g. built from a different/reordered source file) must be
+#      treated as unusable for that question, not silently fused as if it
+#      matched -- every panel row already carries its own `instruction`,
+#      which is exactly the data needed to catch this for free.
+_json_panel_wrong = os.path.join(_results_dir, "test_json_panel_wrong.jsonl")
+with open(_json_panel_wrong, "w", encoding="utf-8") as wf:
+    wf.write(json.dumps({"question_id": 0, "instruction": "a completely different question text",
+                          "correct_letter": "A", "model": "wrong-model", "content": "x", "reasoning": "y"}) + "\n")
+_mismatch_out = os.path.join(_results_dir, "test_mismatch_out.jsonl")
+stderr_mismatch = io.StringIO()
+with contextlib.redirect_stderr(stderr_mismatch):
+    fuse_module.run(base_url, "judge-x", "synth-x", _json_input, [_json_panel_a, _json_panel_wrong], _mismatch_out,
+                     experiment="test-mismatch")
+_mismatch_rows = [json.loads(l) for l in open(_mismatch_out, encoding="utf-8")]
+check("a panel file whose row disagrees with --input about the question text is treated as "
+      "unusable (marked failed), not silently fused as if it matched",
+      _mismatch_rows[0].get("failed") is True and "different question" in _mismatch_rows[0].get("error", ""))
+check("no judge/synthesis call was made for the mismatched question",
+      glob.glob(os.path.join(llm_client.LOG_DIR, "test-mismatch__judge__*")) == []
+      and glob.glob(os.path.join(llm_client.LOG_DIR, "test-mismatch__synthesis__*")) == [])
+os.remove(_json_panel_wrong)
+os.remove(_mismatch_out)
 
-# FAKE mode's synthesis never actually emits "Final Answer: X" (it's a
-# canned stand-in, not instruction-following), so grading the bucketing
-# itself needs a hand-built row with a real parseable answer alongside the
-# missing ground truth -- exercises grade._score directly, not eval.fuse.
-_no_letter_graded_path = os.path.join(_results_dir, "test_no_letter_graded.jsonl")
-with open(_no_letter_graded_path, "w", encoding="utf-8") as f:
-    f.write(json.dumps({"question_id": 0, "fusion": {"content": "Final Answer: A"}}) + "\n")  # no correct_letter
-_no_letter_score = grade_replay(_no_letter_graded_path)["fusion"]
-check("eval.grade buckets a missing correct_letter as no_ground_truth, not as a wrong answer",
-      _no_letter_score["no_ground_truth"] == 1 and _no_letter_score["correct"] == 0
-      and _no_letter_score["call_failed"] == 0 and _no_letter_score["extraction_failed"] == 0)
-os.remove(_no_letter_graded_path)
+for f in (_json_input, _json_panel_a, _json_panel_b):
+    os.remove(f)
 
-# 21i. a --panel row missing `instruction` entirely DOES crash the try block
-#      (there's no message to send) -- must be caught cleanly by the except
-#      handler's .get()-based failure row, not crash the whole run (the
-#      original try-block-scope lesson, now exercised via a field the
-#      except branch doesn't already special-case).
-_no_instruction_panel_path = os.path.join(_results_dir, "test_no_instruction_panel.jsonl")
-with open(_no_instruction_panel_path, "w", encoding="utf-8") as f:
-    f.write(json.dumps({"schema": panel_module.SCHEMA, "question_id": 0, "correct_letter": "A",
-                         # instruction deliberately missing
-                         "panel": [{"model": m, "content": "x", "reasoning": "y"} for m in cfg.PANEL_MODELS]}) + "\n")
-_no_instruction_fuse_out = os.path.join(_results_dir, "test_no_instruction_fuse_out.jsonl")
-fuse_module.run(base_url, "0g/fusion-preview", _no_instruction_panel_path, _no_instruction_fuse_out,
-                experiment="test-no-instruction-row")
-with open(_no_instruction_fuse_out, encoding="utf-8") as f:
-    _no_instruction_rows = [json.loads(l) for l in f]
-check("a panel row missing instruction is caught cleanly (KeyError inside try, handled by the except "
-      "branch's .get()-based row, not a 2nd crash from the except handler itself)",
-      len(_no_instruction_rows) == 1 and _no_instruction_rows[0].get("failed") is True
-      and "instruction" in _no_instruction_rows[0].get("error", ""))
-os.remove(_no_instruction_panel_path)
-os.remove(_no_instruction_fuse_out)
-
-# --- 22. regressions found in the SECOND independent review round ----------
-
-# 22a. eval.panel/eval.baseline must carry forward already-paid rows when the
-#      DATASET shrinks between runs, not just when --limit is set -- the
-#      window they must protect is `expected` (whatever load_tasks() returns
-#      right now), which can shrink for reasons that have nothing to do with
-#      this run's own --limit (a re-download using ITS OWN --limit, writing
-#      over the same default path a full download used).
-_ds_full = os.path.join(_results_dir, "test_ds_full.jsonl")
-_ds_shrunk = os.path.join(_results_dir, "test_ds_shrunk.jsonl")
-_write_dataset(_ds_full, "FULL", n=5)
-_write_dataset(_ds_shrunk, "FULL", n=2)  # same questions, just fewer of them -- like a smaller re-download
-
-_shrink_panel_path = os.path.join(_results_dir, "test_dataset_shrink_panel.jsonl")
-_shrink_baseline_path = os.path.join(_results_dir, "test_dataset_shrink_baseline.jsonl")
+# 20e. a reversed range in --indices ("end" before "start") must be
+#      rejected, not silently contribute zero indices with no warning --
+#      and a non-numeric index must give a clean error, not a raw
+#      traceback.
 try:
-    gpqa_tasks_module.REAL_DEFAULT_PATH = _ds_full
-    panel_module.run(base_url, "0g/fusion-preview", ["m-a"], _shrink_panel_path, experiment="test-ds-shrink-panel")
-    baseline_module.run(base_url, ["b-a"], _shrink_baseline_path, experiment="test-ds-shrink-baseline")
-    check("5 rows written before the dataset shrinks", sum(1 for _ in open(_shrink_panel_path)) == 5)
-
-    gpqa_tasks_module.REAL_DEFAULT_PATH = _ds_shrunk
-    stderr_shrink_p = io.StringIO()
-    with contextlib.redirect_stderr(stderr_shrink_p):
-        panel_module.run(base_url, "0g/fusion-preview", ["m-a"], _shrink_panel_path, experiment="test-ds-shrink-panel")
-    check("eval.panel keeps rows outside a SHRUNK dataset (no --limit involved), doesn't delete them",
-          sum(1 for _ in open(_shrink_panel_path)) == 5)
-    check("eval.panel reports the carried-over count by name", "eval.panel_carried_over=3" in stderr_shrink_p.getvalue())
-
-    stderr_shrink_b = io.StringIO()
-    with contextlib.redirect_stderr(stderr_shrink_b):
-        baseline_module.run(base_url, ["b-a"], _shrink_baseline_path, experiment="test-ds-shrink-baseline")
-    check("eval.baseline keeps rows outside a SHRUNK dataset too",
-          sum(1 for _ in open(_shrink_baseline_path)) == 5)
-    check("eval.baseline reports the carried-over count by name",
-          "eval.baseline_carried_over=3" in stderr_shrink_b.getvalue())
-finally:
-    gpqa_tasks_module.REAL_DEFAULT_PATH = _safe_default
-for _p in (_ds_full, _ds_shrunk, _shrink_panel_path, _shrink_baseline_path):
-    os.remove(_p)
-
-# 22b. eval.panel must say out loud when --models drops a model that was
-#      already cached -- silent trimming is correct-by-design (--models is
-#      the full desired panel, always) but invisible trimming next to
-#      eval.baseline's near-identical, ACCUMULATING --models is a trap.
-_drop_path = os.path.join(_results_dir, "test_drop_models.jsonl")
-panel_module.run(base_url, "0g/fusion-preview", ["m-a", "m-b"], _drop_path, limit=2, experiment="test-drop")
-stderr_drop = io.StringIO()
-with contextlib.redirect_stderr(stderr_drop):
-    panel_module.run(base_url, "0g/fusion-preview", ["m-a"], _drop_path, limit=2, experiment="test-drop")
-check("dropping a cached model via a smaller --models prints a clear warning naming it",
-      "eval.panel_dropped_models" in stderr_drop.getvalue() and "'m-b': 2" in stderr_drop.getvalue())
-os.remove(_drop_path)
-
-# 22c. eval.fuse must refuse to resume a row that was fused from a DIFFERENT
-#      panel than the --panel file given now -- the "forgot to change
-#      --experiment along with --panel" trap. Must fail BEFORE --out is
-#      opened for writing (leaves any prior good rows intact).
-_panel_v1 = os.path.join(_results_dir, "test_fuse_configid_v1.jsonl")
-_panel_v2 = os.path.join(_results_dir, "test_fuse_configid_v2.jsonl")
-panel_module.run(base_url, "0g/fusion-preview", ["m-a"], _panel_v1, limit=2, experiment="test-configid-v1")
-panel_module.run(base_url, "0g/fusion-preview", ["m-a", "m-b"], _panel_v2, limit=2, experiment="test-configid-v2")
-_configid_out = os.path.join(_results_dir, "test_fuse_configid_out.jsonl")
-fuse_module.run(base_url, "0g/fusion-preview", _panel_v1, _configid_out, experiment="test-configid-reused")
+    parse_indices("4-3")
+    check("parse_indices rejects a reversed range instead of silently contributing nothing", False)
+except SystemExit:
+    check("parse_indices rejects a reversed range instead of silently contributing nothing", True)
 try:
-    fuse_module.run(base_url, "0g/fusion-preview", _panel_v2, _configid_out, experiment="test-configid-reused")
-    check("eval.fuse refuses to resume a row fused from a DIFFERENT panel than --panel gives now", False)
-except ResumeMismatchError:
-    check("eval.fuse refuses to resume a row fused from a DIFFERENT panel than --panel gives now", True)
-check("the mismatch aborts before --out is opened for writing, leaving the old (v1) rows intact",
-      all("m-a+m-b" not in json.loads(l)["config_id"] for l in open(_configid_out, encoding="utf-8")))
-for _p in (_panel_v1, _panel_v2, _configid_out):
-    os.remove(_p)
+    parse_indices("not-a-number")
+    check("parse_indices gives a clean error (not a raw traceback) on a non-numeric index", False)
+except SystemExit:
+    check("parse_indices gives a clean error (not a raw traceback) on a non-numeric index", True)
 
-# 22d. eval.grade must refuse to blend two DIFFERENT fusion results for the
-#      same question_id into one score -- e.g. gluing two variant fuse files
-#      together (a glob like `gpqa-fuse-*.jsonl`) instead of grading one at
-#      a time.
-_two_fuse_a = os.path.join(_results_dir, "test_two_fuse_a.jsonl")
-_two_fuse_b = os.path.join(_results_dir, "test_two_fuse_b.jsonl")
-panel_module.run(base_url, "0g/fusion-preview", ["m-a"], _two_fuse_a, limit=1, experiment="test-two-fuse-a-panel")
-panel_module.run(base_url, "0g/fusion-preview", ["m-a", "m-b"], _two_fuse_b, limit=1, experiment="test-two-fuse-b-panel")
-_two_fuse_a_out = os.path.join(_results_dir, "test_two_fuse_a_out.jsonl")
-_two_fuse_b_out = os.path.join(_results_dir, "test_two_fuse_b_out.jsonl")
-fuse_module.run(base_url, "0g/fusion-preview", _two_fuse_a, _two_fuse_a_out, experiment="test-two-fuse-a")
-fuse_module.run(base_url, "0g/fusion-preview", _two_fuse_b, _two_fuse_b_out, experiment="test-two-fuse-b")
-try:
-    grade_replay(_two_fuse_a_out, _two_fuse_b_out)
-    check("eval.grade refuses to merge two different fusion results for the same question_id", False)
-except GradeMergeError:
-    check("eval.grade refuses to merge two different fusion results for the same question_id", True)
-for _p in (_two_fuse_a, _two_fuse_b, _two_fuse_a_out, _two_fuse_b_out):
-    os.remove(_p)
+# 20f. duplicate question_ids within a graded file (e.g. from concatenating
+#      two OVERLAPPING, not disjoint, eval.sample.py batches) must be
+#      deduplicated -- n must reflect distinct questions, not double-count
+#      whichever ids appear twice -- and reported, not silently absorbed.
+_dup_grade_path = os.path.join(_results_dir, "test_dup_grade.jsonl")
+with open(_dup_grade_path, "w", encoding="utf-8") as f:
+    f.write(json.dumps({"question_id": 0, "correct_letter": "A", "content": "Final Answer: A"}) + "\n")
+    f.write(json.dumps({"question_id": 1, "correct_letter": "A", "content": "Final Answer: A"}) + "\n")
+    f.write(json.dumps({"question_id": 0, "correct_letter": "A", "content": "Final Answer: A"}) + "\n")  # dup of 0
+stderr_dup = io.StringIO()
+with contextlib.redirect_stderr(stderr_dup):
+    _dup_result = grade_file(_dup_grade_path)
+check("grade_file dedupes by question_id -- n reflects DISTINCT questions, not the raw line count",
+      _dup_result["n"] == 2 and _dup_result["duplicate_question_ids"] == 1)
+check("...and reports the duplicate on stderr instead of silently absorbing it",
+      "eval.grade_duplicate_question_ids" in stderr_dup.getvalue() and "[0]" in stderr_dup.getvalue())
+os.remove(_dup_grade_path)
 
-# 22e. eval.panel must refuse a --fusion-model that would never reach the
-#      panel_only path (anything not starting with "0g/fusion") -- BEFORE
-#      any calls, instead of billing a real call per question that then
-#      fails with an opaque KeyError.
-_bad_model_out = os.path.join(_results_dir, "test_bad_fusion_model.jsonl")
-panel_module.call_api = _counting_call_api_p
-try:
-    _pcalls["n"] = 0
-    try:
-        panel_module.run(base_url, "gpt-5.6-sol", ["m-a"], _bad_model_out, limit=2, experiment="test-bad-model")
-        check("eval.panel refuses a --fusion-model that doesn't start with '0g/fusion'", False)
-    except ValueError as e:
-        check("eval.panel refuses a --fusion-model that doesn't start with '0g/fusion'", "0g/fusion" in str(e))
-    check("...and refuses it BEFORE making any calls", _pcalls["n"] == 0)
-finally:
-    panel_module.call_api = _orig_call_api_p
-check("...and --out was never created", not os.path.exists(_bad_model_out))
+# 20g. a corrupt/unreadable file must not lose the score for every OTHER
+#      file passed on the same eval.grade command line.
+_good_grade_path = os.path.join(_results_dir, "test_good_grade.jsonl")
+with open(_good_grade_path, "w", encoding="utf-8") as f:
+    f.write(json.dumps({"question_id": 0, "correct_letter": "A", "content": "Final Answer: A"}) + "\n")
+_corrupt_grade_path = os.path.join(_results_dir, "test_corrupt_grade.jsonl")
+with open(_corrupt_grade_path, "w", encoding="utf-8") as f:
+    f.write('{"question_id": 0, "correct_letter": "A", "content": "truncated...')  # invalid JSON, unterminated
+_r = _cli("eval.grade", _good_grade_path, _corrupt_grade_path)
+check("the eval.grade CLI runs end to end (exit 0) even when one file is corrupt", _r.returncode == 0)
+_cli_result = json.loads(_r.stdout)
+check("the good file's score survives; the corrupt file reports its own error instead of crashing everything",
+      _cli_result[_good_grade_path]["accuracy"] == 1.0 and "error" in _cli_result[_corrupt_grade_path])
+os.remove(_good_grade_path)
+os.remove(_corrupt_grade_path)
 
-# --- 23. regressions found reviewing the shared run_replay() extraction ----
-
-# 23a. an exception escaping `process` (a real Ctrl-C is exactly this: a
-#      BaseException the per-item try/except inside each tool can't catch)
-#      must NOT lose a single already-paid row -- neither the ones outside
-#      this run's `items` window at all, NOR the ones inside it that simply
-#      hadn't been reached yet when the interruption hit. The two used to be
-#      the same set (whatever carry_over_unprocessed() considered "outside
-#      expected"); tracking what was actually WRITTEN this attempt, instead
-#      of what was merely requested, covers both -- an interrupted FULL run
-#      (no --limit at all, the common/expensive case) is exactly the case
-#      the older "outside expected" rule protected zero rows in.
-_carry_repro_path = os.path.join(_results_dir, "test_carry_on_exception.jsonl")
-_repro_existing = {i: {"question_id": i, "val": f"old-{i}"} for i in range(6)}
-
-
-def _raise_on_item_1(item, prior):
-    if item == 1:
-        raise RuntimeError("simulated interruption mid-run")
-    return {"question_id": item, "val": f"new-{item}"}, {}
-
-
-try:
-    run_replay([0, 1, 2], lambda x: x, _raise_on_item_1, _carry_repro_path, _repro_existing)
-    check("run_replay propagates an exception from `process` instead of swallowing it", False)
-except RuntimeError:
-    check("run_replay propagates an exception from `process` instead of swallowing it", True)
-_carry_repro_by_qid = {json.loads(l)["question_id"]: json.loads(l) for l in open(_carry_repro_path, encoding="utf-8")}
-check("...still wrote whatever succeeded before the exception (question 0, fresh)",
-      _carry_repro_by_qid[0]["val"] == "new-0")
-check("...restores the IN-WINDOW row that was never reached (question 2, never attempted this run)",
-      _carry_repro_by_qid[2]["val"] == "old-2")
-check("...restores the item that raised itself, too (question 1 -- no new row was ever produced for it)",
-      _carry_repro_by_qid[1]["val"] == "old-1")
-check("...and every row entirely OUTSIDE this run's items (3, 4, 5) survives as before",
-      all(_carry_repro_by_qid[i]["val"] == f"old-{i}" for i in (3, 4, 5)))
-check("nothing is lost or duplicated: all 6 original rows are present, exactly once",
-      sorted(_carry_repro_by_qid) == [0, 1, 2, 3, 4, 5])
-os.remove(_carry_repro_path)
-
-# --- 24. more regressions found in the 3rd independent review round -------
-
-# 24a. --limit must reject 0 and negative values at the CLI -- `if limit:`
-#      (every caller's real check) treats 0 exactly like "no limit at all",
-#      silently running the FULL question set instead of the empty/dry-run
-#      someone typing --limit 0 almost certainly meant.
-for _limit_args, _label in (
-    (["eval.panel", "--models", "m-a", "--limit", "0"], "eval.panel --limit 0"),
-    (["eval.panel", "--models", "m-a", "--limit", "-3"], "eval.panel --limit -3"),
-    (["eval.fuse", "--panel", "does-not-matter.jsonl", "--limit", "0"], "eval.fuse --limit 0"),
-    (["eval.baseline", "--models", "m-a", "--limit", "0"], "eval.baseline --limit 0"),
-):
-    _r = _cli(*_limit_args)
-    check(f"{_label} is rejected at the CLI (not silently treated as no-limit)", _r.returncode != 0)
-
-# 24b. eval.panel must abort the WHOLE run, immediately, if --fusion-url
-#      ignores panel_only and returns a real completion (judge+synthesis
-#      already ran and was billed) -- continuing would repeat that exact
-#      overspend for every remaining question, and the returned panel data
-#      can't be trusted either (may be the server's own default, not
-#      --models).
-_ignored_path = os.path.join(_results_dir, "test_panel_only_ignored.jsonl")
-
-
-def _panel_only_ignored(url, model, msgs, **kw):
-    if kw.get("question_id") == 1:
-        return {"choices": [{"message": {"content": "a real answer, judge+synthesis already ran"}}],
-                "0g_fusion": {"panel": []}}
-    return _orig_call_api_p(url, model, msgs, **kw)
-
-
-panel_module.call_api = _panel_only_ignored
-try:
-    panel_module.run(base_url, "0g/fusion-preview", ["m-a"], _ignored_path, limit=3, experiment="test-ignored")
-    check("eval.panel aborts the whole run when --fusion-url ignores panel_only", False)
-except panel_module.PanelOnlyIgnoredError as e:
-    check("eval.panel aborts the whole run when --fusion-url ignores panel_only",
-          "panel_only" in str(e) and "question_id=1" in str(e))
-finally:
-    panel_module.call_api = _orig_call_api_p
-with open(_ignored_path, encoding="utf-8") as f:
-    _ignored_rows = [json.loads(l) for l in f]
-check("...the question before the bad one still got written (nothing retroactively undone)",
-      len(_ignored_rows) == 1 and _ignored_rows[0]["question_id"] == 0)
-os.remove(_ignored_path)
-
-# 24c. eval.panel must report --reuse's hit rate -- a stale/too-small
-#      --reuse file degrades silently into calling everything fresh
-#      otherwise, with no other visible sign anything was off.
-_reuse_base_path = os.path.join(_results_dir, "test_reuse_visibility_base.jsonl")
-_reuse_variant_path = os.path.join(_results_dir, "test_reuse_visibility_variant.jsonl")
-panel_module.run(base_url, "0g/fusion-preview", ["m-a", "m-b"], _reuse_base_path, limit=3, experiment="test-reuse-vis-base")
-stderr_reuse_hit = io.StringIO()
-with contextlib.redirect_stderr(stderr_reuse_hit):
-    panel_module.run(base_url, "0g/fusion-preview", ["m-a", "m-b", "m-new"], _reuse_variant_path, limit=3,
-                      experiment="test-reuse-vis-variant", reuse_path=_reuse_base_path)
-check("eval.panel reports a nonzero reused= count when --reuse actually has usable data",
-      "eval.panel_reused=6" in stderr_reuse_hit.getvalue())  # 2 models x 3 questions
-
-# a --reuse file with none of the currently-requested models (e.g. pointed
-# at the wrong file, or a stale one from before a rename) has nothing
-# usable at all -- must show reused=0, not stay silent about --reuse having
-# had zero effect.
-_reuse_small_path = os.path.join(_results_dir, "test_reuse_visibility_small.jsonl")
-panel_module.run(base_url, "0g/fusion-preview", ["m-a"], _reuse_small_path, limit=1, experiment="test-reuse-vis-small")
-_reuse_variant2_path = os.path.join(_results_dir, "test_reuse_visibility_variant2.jsonl")
-stderr_reuse_miss = io.StringIO()
-with contextlib.redirect_stderr(stderr_reuse_miss):
-    panel_module.run(base_url, "0g/fusion-preview", ["m-new-2"], _reuse_variant2_path, limit=3,
-                      experiment="test-reuse-vis-variant2", reuse_path=_reuse_small_path)
-check("eval.panel reports reused=0 when --reuse had nothing usable, instead of staying silent",
-      "eval.panel_reused=0" in stderr_reuse_miss.getvalue())
-for _p in (_reuse_base_path, _reuse_variant_path, _reuse_small_path, _reuse_variant2_path):
-    os.remove(_p)
+# 20h. a `question_id` field read from a CSV --input arrives as a string
+#      (csv.DictReader stringifies every field) -- must be coerced to int,
+#      or it becomes a different dict key / random.Random() seed than the
+#      same id read from a JSONL file, silently breaking question_id
+#      matching and shuffle determinism across the two formats.
+_csv_qid_path = os.path.join(_results_dir, "test_csv_qid.csv")
+with open(_csv_qid_path, "w", encoding="utf-8", newline="") as f:
+    f.write("Question,Correct Answer,Incorrect Answer 1,Incorrect Answer 2,Incorrect Answer 3,question_id\n")
+    f.write("Q?,right,wrong1,wrong2,wrong3,7\n")
+_csv_loaded = load_questions(_csv_qid_path)
+check("a question_id read from CSV is coerced to int, not left as the string csv.DictReader produces",
+      _csv_loaded[0][0] == 7 and isinstance(_csv_loaded[0][0], int))
+os.remove(_csv_qid_path)
 
 server.shutdown()
-gpqa_tasks_module.REAL_DEFAULT_PATH = _orig_real_default
 
-# call_logs/ is gitignored and explicitly documented as reproducible-from-a-
-# rerun -- sweep up every log file any "test-*"/"cli-*" experiment name used
-# above left behind (individual sections only clean up their own, narrowly-
-# scoped experiment; this catches the rest) so repeated runs don't accumulate
-# litter.
-for f in glob.glob(os.path.join(llm_client.LOG_DIR, "test-*")) + glob.glob(os.path.join(llm_client.LOG_DIR, "cli-*")):
+# call_logs/ is gitignored and reproducible-from-a-rerun -- sweep up anything
+# any "test-*" experiment name above left behind.
+for f in glob.glob(os.path.join(llm_client.LOG_DIR, "test-*")):
     os.remove(f)
 if os.path.isdir(llm_client.LOG_DIR) and not os.listdir(llm_client.LOG_DIR):
     shutil.rmtree(llm_client.LOG_DIR)

@@ -3,6 +3,11 @@ eval/results/
 results_thinking_probe/
 log_*.txt
 
+# eval.sample.py's output: extracted subsets of a question file. If --input
+# was the real GPQA download, these contain real question text just like
+# the source file does -- same anti-leakage reason as eval/data/* below.
+eval/samples/
+
 # per-call input/output logs written by llm_client._log_call, one file per
 # <experiment>__<role>__<model> -- large, reproducible-from-a-rerun, and for a
 # real GPQA run these contain real question text end to end (not just the

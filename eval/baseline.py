@@ -1,92 +1,59 @@
-"""Compute 1+ baseline model answers for GPQA questions -- completely
-independent of panel/fusion (unlike eval.panel/eval.fuse, this needs no
-input file at all, just the question set). Accumulates into a row's
-`baselines` list across repeated calls targeting the same --out (add model
-2, then model 3, then retry a previously-failed one) rather than replacing
-it -- --models only names what THIS call should end up having present; it
-never removes an already-present different model.
+"""Compute ONE baseline model's answers over a question file -- completely
+independent of eval.panel/eval.fuse, same shape of tool and same row format
+as eval.panel's output (a baseline is, mechanically, just another single
+model answering the same questions the same way).
+
+No resume, no --limit: every run computes every question in --input, fresh,
+and OVERWRITES --out completely. Want two baseline models? Run this twice,
+once per model, each with its own --out.
 
 Run:
-  python3 -m eval.baseline --baseline-url http://localhost:8000 \\
-      --models gpt-5.6-sol,claude-fable-5 --experiment gpqa-baselines
+  python3 -m eval.baseline --model gpt-5.6-sol --api-url http://localhost:8000 \\
+      --input eval/samples/first5.jsonl --out eval/results/baseline-gpt-5.6-sol.jsonl
 """
 import argparse
+import json
+import os
 import sys
 
-from .gpqa_tasks import load_tasks
+from .gpqa_tasks import load_questions, format_question
 from .client import call_api
-from .replay_io import add_out_args, default_out_path, ensure_out_dir, load_existing, parse_models, run_replay
-
-SCHEMA = "0g.fusion_eval.gpqa.baselines.v1"
 
 
-def _base_row(qid, task):
-    return {"schema": SCHEMA, "question_id": qid, "instruction": task["instruction"],
-            "correct_letter": task["correct_letter"]}
-
-
-def run(baseline_url, models, out_path, limit=None, experiment=None, resume=True):
-    ensure_out_dir(out_path)
-    tasks = load_tasks(limit=limit)
-    expected = {t["question_id"]: (t["instruction"], t["correct_letter"]) for t in tasks}
-    existing = load_existing(out_path, expected, expected_schema=SCHEMA) if resume else {}
-
-    def process(task, prior):
-        qid = task["question_id"]
-        prior = prior or {**_base_row(qid, task), "baselines": []}
-        prior_baselines = prior.get("baselines") or []
-        have = {b.get("model") for b in prior_baselines if not b.get("failed")}
-        need = [m for m in models if m not in have]
-        if not need:
-            return prior, {"skipped": 1}
-
-        keep = [b for b in prior_baselines if b.get("model") not in need]
-        messages = [{"role": "user", "content": task["instruction"]}]
-        new_entries = []
-        num_failed = 0
-        for bm in need:
-            # The call AND the entry construction must stay inside this one
-            # try block: indexing the response is itself a failure point, so
-            # a 200-but-wrong-shape response would crash the whole run if
-            # the entry were built outside it.
+def run(api_url, model, input_path, out_path, experiment=None):
+    questions = load_questions(input_path)
+    # eval/results/ is gitignored, so it doesn't exist on a fresh clone -- a
+    # bare open() would fail before writing anything.
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        for question_id, row in questions:
+            instruction, correct_letter = format_question(row, question_id)
+            base = {"question_id": question_id, "instruction": instruction, "correct_letter": correct_letter,
+                    "model": model}
+            messages = [{"role": "user", "content": instruction}]
+            # The call AND the row construction must stay inside this one try
+            # block: indexing the response is itself a failure point, so a
+            # 200-but-wrong-shape response would crash the whole run if the
+            # row were built outside it.
             try:
-                resp = call_api(baseline_url, bm, messages, reasoning_effort="high", experiment=experiment)
-                new_entries.append({
-                    "model": bm,
-                    "content": resp["choices"][0]["message"]["content"],
-                    "reasoning_content": resp["choices"][0]["message"].get("reasoning_content"),
-                    "raw_response": resp,
-                })
+                resp = call_api(api_url, model, messages, reasoning_effort="high", experiment=experiment,
+                                 role="baseline")
+                message = resp["choices"][0]["message"]
+                row_out = {**base, "content": message["content"], "reasoning": message.get("reasoning_content")}
             except Exception as e:
-                num_failed += 1
-                print(f"eval.baseline_question_failed question_id={qid!r} model={bm!r} error={str(e)!r}",
-                      file=sys.stderr)
-                new_entries.append({"model": bm, "failed": True, "error": str(e)})
-
-        row = {**_base_row(qid, task), "baselines": keep + new_entries}
-        return row, ({"failed": num_failed} if num_failed else {})
-
-    counts = run_replay(tasks, lambda t: t["question_id"], process, out_path, existing)
-    skipped, carried, failed = counts.get("skipped", 0), counts.get("carried", 0), counts.get("failed", 0)
-    if skipped:
-        print(f"eval.baseline_resumed skipped={skipped} (already had every requested model for these "
-              f"questions at {out_path!r})", file=sys.stderr)
-    if carried:
-        print(f"eval.baseline_carried_over={carried} (rows outside this run's question set, left "
-              f"untouched at {out_path!r})", file=sys.stderr)
-    if failed:
-        print(f"eval.baseline_summary total={len(tasks)} skipped={skipped} failed={failed}", file=sys.stderr)
+                print(f"eval.baseline_question_failed question_id={question_id!r} model={model!r} "
+                      f"error={str(e)!r}", file=sys.stderr)
+                row_out = {**base, "failed": True, "error": str(e)}
+            f.write(json.dumps(row_out) + "\n")
     return out_path
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--baseline-url", default="http://localhost:8000")
-    p.add_argument("--models", required=True, help="Comma-separated baseline model(s) to have present.")
-    add_out_args(p)
-    p.add_argument("--experiment", default=None, help="Defaults to baselines-<models joined by '+'>.")
+    p.add_argument("--model", required=True, help="Exactly one baseline model.")
+    p.add_argument("--api-url", default="http://localhost:8000")
+    p.add_argument("--input", required=True, help="A question file (see eval.sample.py).")
+    p.add_argument("--out", required=True, help="Always overwritten.")
+    p.add_argument("--experiment", default=None, help="Names call_logs/<experiment>__baseline__<model>.jsonl.")
     args = p.parse_args()
-    models = parse_models(args.models)
-    experiment = args.experiment or f"baselines-{'+'.join(models)}"
-    out = args.out or default_out_path(experiment)
-    print(run(args.baseline_url, models, out, args.limit, experiment, resume=not args.no_resume))
+    print(run(args.api_url, args.model, args.input, args.out, args.experiment))

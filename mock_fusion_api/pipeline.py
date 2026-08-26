@@ -3,10 +3,25 @@ synthesis (1 call). No tool execution anywhere, no iteration anywhere -- mirrors
 structure of quill-cloud-proxy/enclave-go/cmd/enclave/fusion.go (runFusionPanelObserved /
 fusionJudgeRequest / fusionFinalRequest), not its literal code.
 
+This simulates the REAL 0G product's server-side behavior for a genuine
+`model: "0g/fusion*"` request (routed here by handle_chat_completion below) --
+it is a stand-in for an endpoint that doesn't fully exist yet, not part of
+the eval harness's own call graph. eval/panel.py, eval/fuse.py, and
+eval/baseline.py never send a "0g/fusion*" request at all: each of them
+calls one specific real model directly (a panel member, the judge model, the
+synthesis model, or a baseline model) through handle_chat_completion's plain
+passthrough branch, and eval/fuse.py does its OWN panel-evidence/judge/
+synthesis orchestration client-side (reusing panel_evidence/JUDGE_SYSTEM/
+JUDGE_MODELS_WITHOUT_JSON_MODE/SYNTHESIS_FALLBACK_PROMPT from this module,
+since those are the same prompts a real fusion call would use) -- so
+run_fusion/run_panel/run_judge/run_synthesis/cached_panel/panel_only below
+are exercised by this module's own tests (as product-behavior simulation)
+but are dead code from the eval CLI's perspective.
+
 allow_tool_call_output (default False) gates whether panel/synthesis may see caller
 tools and emit a tool_call. The judge stage never gets tools, regardless of the flag.
 
-Thinking (GPQA round): panel and synthesis are called with reasoning_effort=high
+Thinking: panel and synthesis are called with reasoning_effort=high
 (REASONING_ON); the judge is explicitly called with reasoning_effort=none
 (REASONING_OFF) and its content is defensively stripped of any <think> block
 before being treated as JSON -- see llm_client.extract_thinking. Panel evidence
@@ -15,24 +30,15 @@ not content alone.
 
 Judge JSON validity is not enforced (see JUDGE_MODELS_WITHOUT_JSON_MODE) --
 run_judge validates it with json.loads() purely to print a clear stderr
-warning naming the question (request["question_id"], if the eval harness set
-one) and judge model on failure, then continues into synthesis regardless. A
-malformed judge JSON degrades one question's evidence quality; it must not
-abort the run.
-
-Cost-saving reuse: a request may pass `cached_panel` (already-computed panel
-entries) plus `extra_panel_models` (model IDs to actually call fresh) instead
-of `model: "0g/fusion*"` triggering a full fresh panel -- see run_fusion's
-docstring and eval/panel.py, which uses this (plus `panel_only` below) to
-build/extend a panel file without ever paying for judge+synthesis, and
-eval/fuse.py, which runs judge+synthesis against such a file with 0 fresh
-panel calls.
+warning naming the question and judge model on failure, then continues into
+synthesis regardless. A malformed judge JSON degrades one question's
+evidence quality; it must not abort the run.
 
 Call logging: every call_llm() invocation here is tagged with a `role`
-("panel"/"judge"/"synthesis" for the fusion path, "baseline" for the plain
-passthrough path) and forwards request["experiment"] (set by the eval
-harness, e.g. eval.panel's --experiment) straight through. llm_client writes
-the full request+response of each call to
+("panel"/"judge"/"synthesis" for the fusion path; the plain passthrough
+path uses whatever `role` the caller set in the request, falling back to
+"baseline") and forwards request["experiment"] straight through. llm_client
+writes the full request+response of each call to
 call_logs/<experiment>__<role>__<model>.jsonl -- see llm_client.py's
 _log_call. No experiment name -> no log files (keeps tests/dev calls quiet).
 """
@@ -150,10 +156,10 @@ def run_judge(messages, panel_results, experiment=None, question_id=None):
     a single clear stderr line naming the question and judge model, but still
     returns the raw text and lets the pipeline continue into synthesis
     unchanged -- a malformed judge JSON degrades that one question's evidence
-    quality, it must not abort the run. question_id (set by the eval harness,
-    e.g. eval.panel's task["question_id"]) is only used for this message; a
-    caller that never sets it (e.g. debug_fusion_call.py) just gets `None` in
-    the log line instead of a real id."""
+    quality, it must not abort the run. question_id (set by whatever caller
+    sent the "0g/fusion*" request, if it did) is only used for this message;
+    a caller that never sets it just gets `None` in the log line instead of
+    a real id."""
     evidence = panel_evidence(panel_results).split("Panel answers:\n", 1)[-1]
     user = f"Original request summary:\n{_messages_text(messages)}\n\nPanel responses:\n{evidence}"
     supports_json_mode = (cfg.JUDGE_MODEL or "").strip().lower() not in cfg.JUDGE_MODELS_WITHOUT_JSON_MODE
@@ -202,7 +208,10 @@ def _validate_cached_panel(cached_panel):
 
 def run_fusion(request):
     """panel (parallel x1, thinking on) -> judge (x1, thinking off) ->
-    synthesis (x1, thinking on). No loops anywhere.
+    synthesis (x1, thinking on). No loops anywhere. Simulates a genuine
+    `model: "0g/fusion*"` request against the real product; the eval CLI
+    (eval/panel.py, eval/fuse.py, eval/baseline.py) never sends one and so
+    never reaches this function -- see this module's own docstring.
 
     Partial-reuse mode: if the request carries `cached_panel` and/or
     `extra_panel_models`, cfg.PANEL_MODELS is NOT consulted at all -- the
@@ -211,10 +220,8 @@ def run_fusion(request):
     model/content/reasoning/tool_calls) that are used as-is, no LLM call
     made for them; `extra_panel_models` are model IDs actually called fresh
     this round. Passing ALL desired members as `cached_panel` with no
-    `extra_panel_models` makes 0 panel calls -- see eval/fuse.py, which runs
-    judge+synthesis against an already-built eval/panel.py file this way.
-    `panel_only` (below) stops before judge+synthesis entirely -- that's
-    what eval/panel.py itself uses to build/extend a panel file for free."""
+    `extra_panel_models` makes 0 panel calls. `panel_only` (below) stops
+    before judge+synthesis entirely."""
     messages = request["messages"]
     tools = request.get("tools")
     allow = bool(request.get("allow_tool_call_output", False))
@@ -232,10 +239,12 @@ def run_fusion(request):
         panel_results = run_panel(messages, tools, allow, experiment=experiment)
 
     if request.get("panel_only"):
-        # Eval-only cost-saving extension, not a real product feature: stop
-        # right after the panel, paying nothing for judge+synthesis. A real
-        # caller always wants a final answer, so this never fires outside
-        # the eval harness -- see eval/panel.py, which is the only caller.
+        # Not a real product feature: stop right after the panel, paying
+        # nothing for judge+synthesis. A real caller always wants a final
+        # answer, so this never fires in practice -- kept only because
+        # run_fusion's own tests exercise it as part of simulating the
+        # product's request shape; the eval CLI doesn't use it (or any of
+        # run_fusion, for that matter -- see this module's docstring).
         return {"0g_fusion": {"panel": panel_results}}
 
     judge_json = run_judge(messages, panel_results, experiment=experiment, question_id=question_id)
@@ -252,18 +261,24 @@ def run_fusion(request):
 
 def handle_chat_completion(request):
     """Route like isFusionModel() in production: only 0g/fusion* model IDs enter the
-    fusion pipeline; anything else is a single plain passthrough call (used for
-    baselines). The passthrough forwards the caller's reasoning_effort as-is (the
-    eval harness sets it explicitly for baseline calls) and normalizes the
-    response the same way the fusion pipeline does -- clean `content` +
-    separate `reasoning_content` when the model thinks -- so grading code
-    never needs a MiniMax-specific special case."""
+    fusion pipeline; anything else is a single plain passthrough call -- this is
+    the ONLY path eval/panel.py, eval/fuse.py, and eval/baseline.py actually use
+    now, each calling a specific real model directly (a "panel model", "judge
+    model", "synthesis model", and "baseline model" are, mechanically, all just
+    this same passthrough with a different `role` for call-log naming). The
+    passthrough forwards the caller's json_mode/reasoning_effort/role as-is
+    (falling back to role="baseline" if the caller doesn't set one) and
+    normalizes the response the same way the fusion pipeline does -- clean
+    `content` + separate
+    `reasoning_content` when the model thinks -- so grading code never needs a
+    MiniMax-specific special case."""
     if (request.get("model") or "").startswith("0g/fusion"):
         return run_fusion(request)
     allow = bool(request.get("allow_tool_call_output", False))
     msg = call_llm(request["model"], request["messages"], _tools_for(request.get("tools"), allow),
+                    json_mode=bool(request.get("json_mode")),
                     reasoning_effort=request.get("reasoning_effort"),
-                    experiment=request.get("experiment"), role="baseline")
+                    experiment=request.get("experiment"), role=request.get("role") or "baseline")
     reasoning, content = extract_thinking(msg)
     tool_calls = msg.get("tool_calls")
     message = {"role": "assistant", "content": content, "tool_calls": tool_calls}

@@ -1,132 +1,154 @@
-"""Run judge+synthesis over an already-built panel file (eval/panel.py) --
-no panel calls happen here, the panel is used exactly as given. This is the
-one step that actually costs judge+synthesis money, kept separate from
-eval/panel.py on purpose: build, inspect, and reuse a panel as many times as
-you like, then pay for a real fusion result against it exactly when ready.
+"""Run judge+synthesis over N already-computed panel files (see eval.panel.py
+-- typically one per fixed panel member plus one candidate, 5 files) for
+every question in --input, and write the fused answer.
+
+--judge-model and --synthesis-model are always explicit arguments here, not
+global config: this tool has no notion of a single fixed judge/synthesis
+model baked in anywhere else.
+
+--input is the single source of truth for question identity and ground
+truth (instruction/correct_letter are recomputed fresh from it, the same
+deterministic way eval.panel.py did when it built each --panels file) --
+the panel files are ONLY consulted for their (model, content, reasoning)
+answers, keyed by question_id. If any --panels file is missing (or failed)
+a question that's in --input, that ONE question is written as failed
+(naming which file was short) and the run continues -- no judge/synthesis
+call is made for it, so an incomplete panel costs nothing beyond itself.
+
+No resume, no --limit: every run computes every question in --input, fresh,
+and OVERWRITES --out completely.
 
 Run:
-  python3 -m eval.fuse --fusion-url http://localhost:8000 \\
-      --panel eval/results/gpqa-panel-hy3.jsonl --experiment gpqa-fuse-hy3
+  python3 -m eval.fuse --judge-model minimax-m3 --synthesis-model kimi-k3 \\
+      --api-url http://localhost:8000 --input eval/samples/first5.jsonl \\
+      --panels eval/results/panel-minimax-m3.jsonl,eval/results/panel-kimi-k3.jsonl,\\
+eval/results/panel-glm-5.2.jsonl,eval/results/panel-deepseek-v4-pro.jsonl,eval/results/panel-hy3.jsonl \\
+      --out eval/results/fuse-hy3.jsonl
 """
 import argparse
 import json
+import os
 import sys
 
+from .gpqa_tasks import load_questions, format_question
 from .client import call_api
-from .replay_io import ResumeMismatchError, add_out_args, default_out_path, ensure_out_dir, load_existing, run_replay
-
-SCHEMA = "0g.fusion_eval.gpqa.replay.v1"
-
-
-def _base_row(qid, panel_row):
-    return {"schema": SCHEMA, "question_id": qid, "instruction": panel_row.get("instruction"),
-            "correct_letter": panel_row.get("correct_letter")}
+from mock_fusion_api.panel_config import JUDGE_SYSTEM, JUDGE_MODELS_WITHOUT_JSON_MODE, SYNTHESIS_FALLBACK_PROMPT
+from mock_fusion_api.pipeline import panel_evidence
 
 
-def _config_id(fusion_model, panel_row):
-    panel_models = [p["model"] for p in panel_row.get("panel") or []]
-    return f"gpqa-v1-{fusion_model}-on-panel:{'+'.join(panel_models)}"
+def _load_panel_file(path):
+    """question_id -> that file's row, for every question it answered
+    successfully (a `"failed": true` row is treated as absent -- there's no
+    usable answer to fuse for that question from this panel member)."""
+    by_id = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if not row.get("failed"):
+                by_id[row["question_id"]] = row
+    return by_id
 
 
-def run(fusion_url, fusion_model, panel_path, out_path, limit=None, experiment=None, resume=True):
-    with open(panel_path, encoding="utf-8") as f:
-        panel_rows = [json.loads(line) for line in f if line.strip()]
-    if limit:
-        panel_rows = panel_rows[:limit]
-
-    qid_counts = {}
-    for r in panel_rows:
-        qid_counts[r.get("question_id")] = qid_counts.get(r.get("question_id"), 0) + 1
-    dupes = sorted(q for q, count in qid_counts.items() if count > 1)
+def run(api_url, judge_model, synthesis_model, input_path, panel_paths, out_path, experiment=None):
+    dupes = sorted({p for p in panel_paths if panel_paths.count(p) > 1})
     if dupes:
-        raise ValueError(
-            f"{panel_path!r} has duplicate question_id(s) {dupes!r} -- refusing to fuse: judge+synthesis "
-            f"would be paid for twice for those questions. Deduplicate the panel file first."
-        )
+        # The same file listed twice would double-weight that panel member's
+        # vote in judge/synthesis and still bill for it once per occurrence --
+        # never something anyone actually wants, so refuse before any calls.
+        raise ValueError(f"--panels lists the same file more than once: {dupes!r}")
 
-    expected = {r.get("question_id"): (r.get("instruction"), r.get("correct_letter")) for r in panel_rows}
-    existing = load_existing(out_path, expected, expected_schema=SCHEMA) if resume else {}
-    # load_existing() only checks instruction/correct_letter/schema -- it has
-    # no idea what a "panel" even means. But two panel files can easily share
-    # a question set while differing in panel COMPOSITION (that's the whole
-    # point of eval.panel --reuse variants), and --experiment is just a
-    # string the operator has to remember to change alongside --panel. Catch
-    # that here, before --out is opened for writing, so a stale --experiment
-    # aimed at a different --panel is refused instead of silently reporting
-    # "already fused" against the WRONG panel's judge+synthesis result.
-    for panel_row in panel_rows:
-        qid = panel_row.get("question_id")
-        prior = existing.get(qid)
-        if prior is None or prior.get("failed") or not prior.get("config_id"):
-            continue
-        this_config_id = _config_id(fusion_model, panel_row)
-        if prior["config_id"] != this_config_id:
-            raise ResumeMismatchError(
-                f"{out_path!r} already has a row for question_id={qid!r} fused from a DIFFERENT panel "
-                f"than {panel_path!r} gives now -- prior config_id={prior['config_id']!r}, this run "
-                f"would produce {this_config_id!r}. --experiment likely wasn't changed along with "
-                f"--panel. Use a new --experiment/--out, or --no-resume to recompute."
-            )
-    ensure_out_dir(out_path)
+    questions = load_questions(input_path)
+    panels = [(path, _load_panel_file(path)) for path in panel_paths]
+    # eval/results/ is gitignored, so it doesn't exist on a fresh clone -- a
+    # bare open() would fail before writing anything.
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
-    def process(panel_row, prior):
-        qid = panel_row.get("question_id")
-        if prior is not None and not prior.get("failed"):
-            return prior, {"skipped": 1}
+    with open(out_path, "w", encoding="utf-8") as f:
+        for question_id, row in questions:
+            instruction, correct_letter = format_question(row, question_id)
+            base = {"question_id": question_id, "instruction": instruction, "correct_letter": correct_letter,
+                    "judge_model": judge_model, "synthesis_model": synthesis_model}
 
-        if panel_row.get("failed") or not panel_row.get("panel"):
-            print(f"eval.fuse_question_skipped question_id={qid!r} reason='no panel available'", file=sys.stderr)
-            return ({**_base_row(qid, panel_row), "failed": True,
-                     "error": panel_row.get("error", "no panel available")}, {"failed": 1})
+            # A panel file is unusable for this question if it's missing the
+            # question entirely (or that row failed) -- OR if the row it DOES
+            # have disagrees with --input about what the question even is
+            # (e.g. --panels built from a different/reordered question file).
+            # Either way, fusing it would silently answer the wrong question
+            # while looking completely normal, so catch it here using data
+            # already in hand (every panel row already carries its own
+            # `instruction`) rather than trusting question_id alone.
+            bad = []
+            for path, by_id in panels:
+                prow = by_id.get(question_id)
+                if prow is None:
+                    bad.append(f"{path!r} (missing/failed)")
+                elif prow.get("instruction") is not None and prow["instruction"] != instruction:
+                    bad.append(f"{path!r} (different question than --input)")
+            if bad:
+                print(f"eval.fuse_question_skipped question_id={question_id!r} reason={bad!r}", file=sys.stderr)
+                f.write(json.dumps({**base, "failed": True,
+                                    "error": f"unusable panel file(s) for this question: {bad}"}) + "\n")
+                continue
 
-        # The call AND the row construction (including reading instruction/
-        # correct_letter/panel back out of panel_row) must all stay inside
-        # this one try block: any of those is itself a failure point on a
-        # malformed panel row, and the except branch below only uses .get()
-        # so it can't ALSO raise while building the failure row.
-        try:
-            messages = [{"role": "user", "content": panel_row["instruction"]}]
-            fusion_resp = call_api(fusion_url, fusion_model, messages, cached_panel=panel_row["panel"],
-                                    experiment=experiment, question_id=qid)
-            row = {
-                **_base_row(qid, panel_row),
-                "panel": panel_row["panel"],
-                "fusion": {
-                    "model": fusion_model,
-                    "content": fusion_resp["choices"][0]["message"]["content"],
-                    "reasoning_content": fusion_resp["choices"][0]["message"].get("reasoning_content"),
-                    "raw_response": fusion_resp,
-                },
-                "config_id": _config_id(fusion_model, panel_row),
-            }
-            return row, {}
-        except Exception as e:
-            print(f"eval.fuse_question_failed question_id={qid!r} error={str(e)!r}", file=sys.stderr)
-            row = {**_base_row(qid, panel_row), "panel": panel_row.get("panel"), "failed": True, "error": str(e)}
-            return row, {"failed": 1}
+            panel_rows = [by_id[question_id] for _, by_id in panels]
+            panel_models = [r.get("model") for r in panel_rows]
+            panel_results = [{"content": r.get("content"), "reasoning": r.get("reasoning")} for r in panel_rows]
 
-    counts = run_replay(panel_rows, lambda r: r.get("question_id"), process, out_path, existing)
-    skipped, carried, failed = counts.get("skipped", 0), counts.get("carried", 0), counts.get("failed", 0)
-    if skipped:
-        print(f"eval.fuse_resumed skipped={skipped} (already had a successful result at {out_path!r})",
-              file=sys.stderr)
-    if carried:
-        print(f"eval.fuse_carried_over={carried} (rows outside this run's --panel/--limit window, "
-              f"left untouched at {out_path!r})", file=sys.stderr)
-    if failed:
-        print(f"eval.fuse_summary total={len(panel_rows)} skipped={skipped} failed={failed}", file=sys.stderr)
+            # The judge call, the synthesis call, AND the row construction
+            # must all stay inside this one try block: indexing either
+            # response is itself a failure point, so a 200-but-wrong-shape
+            # response would crash the whole run if the row were built
+            # outside it.
+            try:
+                evidence = panel_evidence(panel_results)
+                judge_user = (f"Original request summary:\nUSER: {instruction}\n\nPanel responses:\n"
+                               + evidence.split("Panel answers:\n", 1)[-1])
+                supports_json_mode = judge_model.strip().lower() not in JUDGE_MODELS_WITHOUT_JSON_MODE
+                judge_resp = call_api(
+                    api_url, judge_model,
+                    [{"role": "system", "content": JUDGE_SYSTEM}, {"role": "user", "content": judge_user}],
+                    json_mode=supports_json_mode, reasoning_effort="none", experiment=experiment, role="judge")
+                judge_json = judge_resp["choices"][0]["message"]["content"] or "{}"
+                try:
+                    json.loads(judge_json)
+                except json.JSONDecodeError as je:
+                    # Visibility only: a malformed judge JSON degrades this
+                    # one question's synthesis evidence quality, it must not
+                    # abort the run.
+                    print(f"eval.fuse_judge_json_invalid question_id={question_id!r} "
+                          f"judge_model={judge_model!r} error={str(je)!r}", file=sys.stderr)
+
+                synth_user = f"{SYNTHESIS_FALLBACK_PROMPT}\n\n{evidence}\n\nJudge analysis JSON:\n{judge_json}"
+                synth_resp = call_api(api_url, synthesis_model,
+                                       [{"role": "user", "content": instruction},
+                                        {"role": "user", "content": synth_user}],
+                                       reasoning_effort="high", experiment=experiment, role="synthesis")
+                synth_message = synth_resp["choices"][0]["message"]
+                row_out = {**base, "panel_models": panel_models, "content": synth_message["content"],
+                           "reasoning": synth_message.get("reasoning_content"), "judge_json": judge_json}
+            except Exception as e:
+                print(f"eval.fuse_question_failed question_id={question_id!r} error={str(e)!r}", file=sys.stderr)
+                row_out = {**base, "panel_models": panel_models, "failed": True, "error": str(e)}
+            f.write(json.dumps(row_out) + "\n")
     return out_path
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--fusion-url", default="http://localhost:8000")
-    p.add_argument("--fusion-model", default="0g/fusion-preview")
-    p.add_argument("--panel", required=True, help="A panel file from eval.panel.")
-    add_out_args(p)
-    p.add_argument("--experiment", default=None, help="Defaults to fuse-on-<panel filename>.")
+    p.add_argument("--judge-model", required=True)
+    p.add_argument("--synthesis-model", required=True)
+    p.add_argument("--api-url", default="http://localhost:8000")
+    p.add_argument("--input", required=True, help="A question file (see eval.sample.py).")
+    p.add_argument("--panels", required=True, help="Comma-separated eval.panel.py output files.")
+    p.add_argument("--out", required=True, help="Always overwritten.")
+    p.add_argument("--experiment", default=None,
+                    help="Names call_logs/<experiment>__judge__<model>.jsonl and __synthesis__<model>.jsonl.")
     args = p.parse_args()
-    experiment = args.experiment or f"fuse-on-{args.panel.rsplit('/', 1)[-1].removesuffix('.jsonl')}"
-    out = args.out or default_out_path(experiment)
-    print(run(args.fusion_url, args.fusion_model, args.panel, out, args.limit, experiment,
-              resume=not args.no_resume))
+    panel_paths = [s.strip() for s in args.panels.split(",") if s.strip()]
+    if not panel_paths:
+        p.error("--panels must name at least one file")
+    print(run(args.api_url, args.judge_model, args.synthesis_model, args.input, panel_paths, args.out,
+              args.experiment))
