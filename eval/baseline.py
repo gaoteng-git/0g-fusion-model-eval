@@ -16,8 +16,7 @@ import sys
 
 from .gpqa_tasks import load_tasks
 from .client import call_api
-from .replay_io import (ResumeMismatchError, carry_over_unprocessed, default_out_path,  # noqa: F401
-                         ensure_out_dir, load_existing)
+from .replay_io import carry_over_unprocessed, default_out_path, ensure_out_dir, load_existing
 
 SCHEMA = "0g.fusion_eval.gpqa.baselines.v1"
 
@@ -39,14 +38,14 @@ def run(baseline_url, models, out_path, limit=None, experiment=None, resume=True
             qid = task["question_id"]
             prior = existing.get(qid) or {**_base_row(qid, task), "baselines": []}
             prior_baselines = prior.get("baselines") or []
-            have = {b["model"] for b in prior_baselines if not b.get("failed")}
+            have = {b.get("model") for b in prior_baselines if not b.get("failed")}
             need = [m for m in models if m not in have]
             if not need:
                 skipped += 1
                 f.write(json.dumps(prior) + "\n")
                 continue
 
-            keep = [b for b in prior_baselines if b["model"] not in need]
+            keep = [b for b in prior_baselines if b.get("model") not in need]
             messages = [{"role": "user", "content": task["instruction"]}]
             new_entries = []
             for bm in need:
@@ -70,11 +69,18 @@ def run(baseline_url, models, out_path, limit=None, experiment=None, resume=True
 
             row = {**_base_row(qid, task), "baselines": keep + new_entries}
             f.write(json.dumps(row) + "\n")
-        if limit:
-            skipped += carry_over_unprocessed(f, existing, expected)
+        # Always carry forward rows outside `expected`, not just when --limit
+        # is set: `expected` can also shrink because load_tasks()'s underlying
+        # dataset file shrank (e.g. re-downloaded with its own --limit) with
+        # no --limit given to THIS run at all. Guarding this on `limit` alone
+        # missed exactly that case and silently deleted already-paid rows.
+        carried = carry_over_unprocessed(f, existing, expected)
     if skipped:
         print(f"eval.baseline_resumed skipped={skipped} (already had every requested model for these "
               f"questions at {out_path!r})", file=sys.stderr)
+    if carried:
+        print(f"eval.baseline_carried_over={carried} (rows outside this run's question set, left "
+              f"untouched at {out_path!r})", file=sys.stderr)
     if failed:
         print(f"eval.baseline_summary total={len(tasks)} skipped={skipped} failed={failed}", file=sys.stderr)
     return out_path

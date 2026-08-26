@@ -33,8 +33,7 @@ import sys
 
 from .gpqa_tasks import load_tasks
 from .client import call_api
-from .replay_io import (ResumeMismatchError, carry_over_unprocessed, default_out_path,  # noqa: F401
-                         ensure_out_dir, load_existing)
+from .replay_io import carry_over_unprocessed, default_out_path, ensure_out_dir, load_existing
 
 
 SCHEMA = "0g.fusion_eval.gpqa.panel.v1"
@@ -51,6 +50,16 @@ def _base_row(qid, task):
 
 def run(fusion_url, fusion_model, models, out_path, limit=None, experiment=None, resume=True, reuse_path=None):
     ensure_out_dir(out_path)
+    if not fusion_model.startswith("0g/fusion"):
+        # mock_fusion_api.handle_chat_completion only enters the panel_only
+        # path for a "0g/fusion*" model id -- anything else silently falls
+        # through to the plain baseline passthrough instead, which bills one
+        # real call per question and returns no `0g_fusion.panel` at all
+        # (every question ends up "failed" with a bare KeyError). Refuse
+        # before paying for that.
+        raise ValueError(f"--fusion-model {fusion_model!r} does not start with '0g/fusion' -- it "
+                          f"would never reach the panel_only path and every question would fail "
+                          f"after being billed as a plain baseline call instead.")
     if reuse_path and not os.path.exists(reuse_path):
         # load_existing() below would otherwise treat a missing --reuse path
         # exactly like a brand-new --out (returns {}) and silently re-call
@@ -66,6 +75,7 @@ def run(fusion_url, fusion_model, models, out_path, limit=None, experiment=None,
     reuse = load_existing(reuse_path, expected, expected_schema=SCHEMA) if reuse_path else {}
 
     skipped = failed = 0
+    dropped = {}  # model -> number of questions where a prior answer for it is being discarded
     with open(out_path, "w", encoding="utf-8") as f:
         for task in tasks:
             qid = task["question_id"]
@@ -75,6 +85,15 @@ def run(fusion_url, fusion_model, models, out_path, limit=None, experiment=None,
             # models successfully cached, and those are worth keeping instead
             # of re-calling them too.
             have_here = _panel_by_model(prior) if prior else {}
+            # --models is the FULL desired panel, always -- a model present
+            # here but not in --models gets dropped from the row, silently
+            # except for this count. Surfacing it matters: a near-identical
+            # `eval.baseline --models x --out <file>` ACCUMULATES instead of
+            # replacing, so typing the panel version of that command by
+            # habit would otherwise throw away already-paid panel members
+            # with no visible sign anything happened.
+            for m in set(have_here) - set(models):
+                dropped[m] = dropped.get(m, 0) + 1
             have_reuse = _panel_by_model(reuse.get(qid, {}))
             cached, fresh_models = [], []
             for m in models:
@@ -113,11 +132,23 @@ def run(fusion_url, fusion_model, models, out_path, limit=None, experiment=None,
                 # re-paying for models that already succeeded.
                 row = {**_base_row(qid, task), "panel": cached, "failed": True, "error": str(e)}
             f.write(json.dumps(row) + "\n")
-        if limit:
-            skipped += carry_over_unprocessed(f, existing, expected)
+        # Always carry forward rows outside `expected`, not just when --limit
+        # is set: `expected` can also shrink because load_tasks()'s underlying
+        # dataset file shrank (e.g. re-downloaded with its own --limit) with
+        # no --limit given to THIS run at all. Guarding this on `limit` alone
+        # missed exactly that case and silently deleted already-paid rows.
+        carried = carry_over_unprocessed(f, existing, expected)
     if skipped:
         print(f"eval.panel_resumed skipped={skipped} (already had every requested model for these "
               f"questions at {out_path!r})", file=sys.stderr)
+    if carried:
+        print(f"eval.panel_carried_over={carried} (rows outside this run's question set, left "
+              f"untouched at {out_path!r})", file=sys.stderr)
+    if dropped:
+        print(f"eval.panel_dropped_models={dropped} (present in {out_path!r} before this run, not in "
+              f"--models this time, so removed from these questions' panel -- expected if you meant to "
+              f"shrink the panel, a mistake if you meant eval.baseline's accumulate behavior instead)",
+              file=sys.stderr)
     if failed:
         print(f"eval.panel_summary total={len(tasks)} skipped={skipped} failed={failed}", file=sys.stderr)
     return out_path

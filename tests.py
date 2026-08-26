@@ -585,6 +585,7 @@ from eval import panel as panel_module  # noqa: E402
 from eval import fuse as fuse_module  # noqa: E402
 from eval import baseline as baseline_module  # noqa: E402
 from eval.grade import grade_replay, load_rows  # noqa: E402
+from eval.replay_io import ResumeMismatchError  # noqa: E402
 
 _results_dir = os.path.join(os.path.dirname(__file__), "eval", "results")
 
@@ -1047,11 +1048,14 @@ with open(shapes_path, "w", encoding="utf-8") as f:
         f.write(json.dumps(_r) + "\n")
 shape_scores = grade_replay(shapes_path)
 check("grade_replay: fusion scores 3/4 with the row-level failure as call_failed",
-      shape_scores["fusion"] == {"accuracy": 0.75, "correct": 3, "extraction_failed": 0, "call_failed": 1, "n": 4})
+      shape_scores["fusion"] == {"accuracy": 0.75, "correct": 3, "extraction_failed": 0, "call_failed": 1,
+                                  "no_ground_truth": 0, "n": 4})
 check("grade_replay: baseline A = 1 correct, 1 unparseable, 2 rows it was never run for",
-      shape_scores["baselines"]["A"] == {"accuracy": 0.25, "correct": 1, "extraction_failed": 1, "call_failed": 2, "n": 4})
+      shape_scores["baselines"]["A"] == {"accuracy": 0.25, "correct": 1, "extraction_failed": 1, "call_failed": 2,
+                                          "no_ground_truth": 0, "n": 4})
 check("grade_replay: baseline B = answered once (wrong), failed/absent the other 3",
-      shape_scores["baselines"]["B"] == {"accuracy": 0.0, "correct": 0, "extraction_failed": 0, "call_failed": 3, "n": 4})
+      shape_scores["baselines"]["B"] == {"accuracy": 0.0, "correct": 0, "extraction_failed": 0, "call_failed": 3,
+                                          "no_ground_truth": 0, "n": 4})
 check("grade_replay lists exactly the models that appear in any baselines list",
       sorted(shape_scores["baselines"]) == ["A", "B"])
 os.remove(shapes_path)
@@ -1091,7 +1095,7 @@ try:
         panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS), swap_panel_path, limit=3,
                           experiment="test-swap")
         check("eval.panel refuses to resume rows written against a DIFFERENT dataset", False)
-    except panel_module.ResumeMismatchError:
+    except ResumeMismatchError:
         check("eval.panel refuses to resume rows written against a DIFFERENT dataset", True)
     check("the mismatch aborts before --out is opened for writing, leaving the old rows intact",
           all("DATASET-A" in json.loads(l)["instruction"] for l in open(swap_panel_path, encoding="utf-8")))
@@ -1114,7 +1118,7 @@ try:
     try:
         baseline_module.run(base_url, ["bl"], swap_baseline_path, limit=3, experiment="test-swap-bl")
         check("eval.baseline refuses to resume rows written against a DIFFERENT dataset", False)
-    except baseline_module.ResumeMismatchError:
+    except ResumeMismatchError:
         check("eval.baseline refuses to resume rows written against a DIFFERENT dataset", True)
 finally:
     gpqa_tasks_module.REAL_DEFAULT_PATH = _safe_default
@@ -1141,7 +1145,7 @@ fuse_module.run(base_url, "0g/fusion-preview", fuse_swap_panel_a, fuse_swap_out,
 try:
     fuse_module.run(base_url, "0g/fusion-preview", fuse_swap_panel_b, fuse_swap_out, experiment="test-fuse-swap")
     check("eval.fuse refuses to resume rows written against a different --panel file's questions", False)
-except fuse_module.ResumeMismatchError:
+except ResumeMismatchError:
     check("eval.fuse refuses to resume rows written against a different --panel file's questions", True)
 os.remove(fuse_swap_panel_a)
 os.remove(fuse_swap_panel_b)
@@ -1244,7 +1248,7 @@ _shutil.copy(_schema_src, _schema_baseline_out)
 try:
     baseline_module.run(base_url, ["some-model"], _schema_baseline_out, limit=2, experiment="test-schema-b")
     check("eval.baseline refuses to reuse an --out written by eval.panel (different schema)", False)
-except baseline_module.ResumeMismatchError:
+except ResumeMismatchError:
     check("eval.baseline refuses to reuse an --out written by eval.panel (different schema)", True)
 os.remove(_schema_baseline_out)
 
@@ -1253,7 +1257,7 @@ baseline_module.run(base_url, ["some-model"], _schema_fuse_out, limit=2, experim
 try:
     fuse_module.run(base_url, "0g/fusion-preview", _schema_src, _schema_fuse_out, experiment="test-schema-f2")
     check("eval.fuse refuses to reuse an --out written by eval.baseline (different schema)", False)
-except fuse_module.ResumeMismatchError:
+except ResumeMismatchError:
     check("eval.fuse refuses to reuse an --out written by eval.baseline (different schema)", True)
 os.remove(_schema_fuse_out)
 
@@ -1264,7 +1268,7 @@ _shutil.copy(_schema_src, _schema_selffuse)
 try:
     fuse_module.run(base_url, "0g/fusion-preview", _schema_src, _schema_selffuse, experiment="test-schema-self")
     check("eval.fuse refuses to treat a --panel-shaped --out as already-fused", False)
-except fuse_module.ResumeMismatchError:
+except ResumeMismatchError:
     check("eval.fuse refuses to treat a --panel-shaped --out as already-fused", True)
 os.remove(_schema_selffuse)
 
@@ -1274,13 +1278,13 @@ try:
     panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS), _schema_panel_out, limit=2,
                       experiment="test-schema-p2")
     check("eval.panel refuses to reuse an --out written by eval.baseline (different schema)", False)
-except panel_module.ResumeMismatchError:
+except ResumeMismatchError:
     check("eval.panel refuses to reuse an --out written by eval.baseline (different schema)", True)
 try:
     panel_module.run(base_url, "0g/fusion-preview", list(cfg.PANEL_MODELS), _schema_src, limit=2,
                       experiment="test-schema-p3", reuse_path=_schema_panel_out)
     check("eval.panel's --reuse refuses a file written by eval.baseline (different schema)", False)
-except panel_module.ResumeMismatchError:
+except ResumeMismatchError:
     check("eval.panel's --reuse refuses a file written by eval.baseline (different schema)", True)
 os.remove(_schema_panel_out)
 os.remove(_schema_src)
@@ -1420,36 +1424,173 @@ except ValueError as e:
 check("...and nothing was called before the check failed", not os.path.exists(_dup_qid_fuse_out))
 os.remove(_dup_qid_panel)
 
-# 21h. a malformed --panel row (missing correct_letter) must be caught
-#      cleanly, not crash the whole run with a 2nd exception from inside
-#      the except handler itself (the try-block-scope lesson, again).
-_malformed_panel_row_path = os.path.join(_results_dir, "test_malformed_panel_row.jsonl")
-with open(_malformed_panel_row_path, "w", encoding="utf-8") as f:
+# 21h. a --panel row missing correct_letter (but with everything else) must
+#      NOT crash even when the call SUCCEEDS -- it's ungradeable, not a call
+#      failure, so eval.fuse must write it through normally (with
+#      correct_letter: null) and let eval.grade's no_ground_truth bucket
+#      flag it, instead of the row itself pretending nothing's wrong.
+_no_letter_panel_path = os.path.join(_results_dir, "test_no_letter_panel.jsonl")
+with open(_no_letter_panel_path, "w", encoding="utf-8") as f:
     f.write(json.dumps({"schema": panel_module.SCHEMA, "question_id": 0, "instruction": "Q?",
                          # correct_letter deliberately missing
                          "panel": [{"model": m, "content": "x", "reasoning": "y"} for m in cfg.PANEL_MODELS]}) + "\n")
-_malformed_fuse_out = os.path.join(_results_dir, "test_malformed_fuse_out.jsonl")
+_no_letter_fuse_out = os.path.join(_results_dir, "test_no_letter_fuse_out.jsonl")
+fuse_module.run(base_url, "0g/fusion-preview", _no_letter_panel_path, _no_letter_fuse_out,
+                experiment="test-no-letter-row")
+with open(_no_letter_fuse_out, encoding="utf-8") as f:
+    _no_letter_rows = [json.loads(l) for l in f]
+check("a panel row missing correct_letter fuses successfully (not a call failure), correct_letter stays null",
+      len(_no_letter_rows) == 1 and "failed" not in _no_letter_rows[0]
+      and _no_letter_rows[0]["correct_letter"] is None and _no_letter_rows[0]["fusion"]["content"])
+os.remove(_no_letter_panel_path)
+os.remove(_no_letter_fuse_out)
 
+# FAKE mode's synthesis never actually emits "Final Answer: X" (it's a
+# canned stand-in, not instruction-following), so grading the bucketing
+# itself needs a hand-built row with a real parseable answer alongside the
+# missing ground truth -- exercises grade._score directly, not eval.fuse.
+_no_letter_graded_path = os.path.join(_results_dir, "test_no_letter_graded.jsonl")
+with open(_no_letter_graded_path, "w", encoding="utf-8") as f:
+    f.write(json.dumps({"question_id": 0, "fusion": {"content": "Final Answer: A"}}) + "\n")  # no correct_letter
+_no_letter_score = grade_replay(_no_letter_graded_path)["fusion"]
+check("eval.grade buckets a missing correct_letter as no_ground_truth, not as a wrong answer",
+      _no_letter_score["no_ground_truth"] == 1 and _no_letter_score["correct"] == 0
+      and _no_letter_score["call_failed"] == 0 and _no_letter_score["extraction_failed"] == 0)
+os.remove(_no_letter_graded_path)
 
-def _fail_correct_letter_lookup(url, model, msgs, **kw):
-    raise RuntimeError("doesn't matter, correct_letter access itself should fail first")
+# 21i. a --panel row missing `instruction` entirely DOES crash the try block
+#      (there's no message to send) -- must be caught cleanly by the except
+#      handler's .get()-based failure row, not crash the whole run (the
+#      original try-block-scope lesson, now exercised via a field the
+#      except branch doesn't already special-case).
+_no_instruction_panel_path = os.path.join(_results_dir, "test_no_instruction_panel.jsonl")
+with open(_no_instruction_panel_path, "w", encoding="utf-8") as f:
+    f.write(json.dumps({"schema": panel_module.SCHEMA, "question_id": 0, "correct_letter": "A",
+                         # instruction deliberately missing
+                         "panel": [{"model": m, "content": "x", "reasoning": "y"} for m in cfg.PANEL_MODELS]}) + "\n")
+_no_instruction_fuse_out = os.path.join(_results_dir, "test_no_instruction_fuse_out.jsonl")
+fuse_module.run(base_url, "0g/fusion-preview", _no_instruction_panel_path, _no_instruction_fuse_out,
+                experiment="test-no-instruction-row")
+with open(_no_instruction_fuse_out, encoding="utf-8") as f:
+    _no_instruction_rows = [json.loads(l) for l in f]
+check("a panel row missing instruction is caught cleanly (KeyError inside try, handled by the except "
+      "branch's .get()-based row, not a 2nd crash from the except handler itself)",
+      len(_no_instruction_rows) == 1 and _no_instruction_rows[0].get("failed") is True
+      and "instruction" in _no_instruction_rows[0].get("error", ""))
+os.remove(_no_instruction_panel_path)
+os.remove(_no_instruction_fuse_out)
 
+# --- 22. regressions found in the SECOND independent review round ----------
 
-fuse_module.call_api = _fail_correct_letter_lookup
+# 22a. eval.panel/eval.baseline must carry forward already-paid rows when the
+#      DATASET shrinks between runs, not just when --limit is set -- the
+#      window they must protect is `expected` (whatever load_tasks() returns
+#      right now), which can shrink for reasons that have nothing to do with
+#      this run's own --limit (a re-download using ITS OWN --limit, writing
+#      over the same default path a full download used).
+_ds_full = os.path.join(_results_dir, "test_ds_full.jsonl")
+_ds_shrunk = os.path.join(_results_dir, "test_ds_shrunk.jsonl")
+_write_dataset(_ds_full, "FULL", n=5)
+_write_dataset(_ds_shrunk, "FULL", n=2)  # same questions, just fewer of them -- like a smaller re-download
+
+_shrink_panel_path = os.path.join(_results_dir, "test_dataset_shrink_panel.jsonl")
+_shrink_baseline_path = os.path.join(_results_dir, "test_dataset_shrink_baseline.jsonl")
 try:
-    fuse_module.run(base_url, "0g/fusion-preview", _malformed_panel_row_path, _malformed_fuse_out,
-                     experiment="test-malformed-row")
-    check("eval.fuse doesn't crash on a --panel row missing correct_letter", True)
-except Exception as e:
-    check(f"eval.fuse doesn't crash on a --panel row missing correct_letter, got {type(e).__name__} instead", False)
+    gpqa_tasks_module.REAL_DEFAULT_PATH = _ds_full
+    panel_module.run(base_url, "0g/fusion-preview", ["m-a"], _shrink_panel_path, experiment="test-ds-shrink-panel")
+    baseline_module.run(base_url, ["b-a"], _shrink_baseline_path, experiment="test-ds-shrink-baseline")
+    check("5 rows written before the dataset shrinks", sum(1 for _ in open(_shrink_panel_path)) == 5)
+
+    gpqa_tasks_module.REAL_DEFAULT_PATH = _ds_shrunk
+    stderr_shrink_p = io.StringIO()
+    with contextlib.redirect_stderr(stderr_shrink_p):
+        panel_module.run(base_url, "0g/fusion-preview", ["m-a"], _shrink_panel_path, experiment="test-ds-shrink-panel")
+    check("eval.panel keeps rows outside a SHRUNK dataset (no --limit involved), doesn't delete them",
+          sum(1 for _ in open(_shrink_panel_path)) == 5)
+    check("eval.panel reports the carried-over count by name", "eval.panel_carried_over=3" in stderr_shrink_p.getvalue())
+
+    stderr_shrink_b = io.StringIO()
+    with contextlib.redirect_stderr(stderr_shrink_b):
+        baseline_module.run(base_url, ["b-a"], _shrink_baseline_path, experiment="test-ds-shrink-baseline")
+    check("eval.baseline keeps rows outside a SHRUNK dataset too",
+          sum(1 for _ in open(_shrink_baseline_path)) == 5)
+    check("eval.baseline reports the carried-over count by name",
+          "eval.baseline_carried_over=3" in stderr_shrink_b.getvalue())
 finally:
-    fuse_module.call_api = _orig_call_api_f
-with open(_malformed_fuse_out, encoding="utf-8") as f:
-    _malformed_rows = [json.loads(l) for l in f]
-check("the malformed row is marked failed with a real error, not a 2nd crash from the except handler",
-      len(_malformed_rows) == 1 and _malformed_rows[0].get("failed") is True)
-os.remove(_malformed_panel_row_path)
-os.remove(_malformed_fuse_out)
+    gpqa_tasks_module.REAL_DEFAULT_PATH = _safe_default
+for _p in (_ds_full, _ds_shrunk, _shrink_panel_path, _shrink_baseline_path):
+    os.remove(_p)
+
+# 22b. eval.panel must say out loud when --models drops a model that was
+#      already cached -- silent trimming is correct-by-design (--models is
+#      the full desired panel, always) but invisible trimming next to
+#      eval.baseline's near-identical, ACCUMULATING --models is a trap.
+_drop_path = os.path.join(_results_dir, "test_drop_models.jsonl")
+panel_module.run(base_url, "0g/fusion-preview", ["m-a", "m-b"], _drop_path, limit=2, experiment="test-drop")
+stderr_drop = io.StringIO()
+with contextlib.redirect_stderr(stderr_drop):
+    panel_module.run(base_url, "0g/fusion-preview", ["m-a"], _drop_path, limit=2, experiment="test-drop")
+check("dropping a cached model via a smaller --models prints a clear warning naming it",
+      "eval.panel_dropped_models" in stderr_drop.getvalue() and "'m-b': 2" in stderr_drop.getvalue())
+os.remove(_drop_path)
+
+# 22c. eval.fuse must refuse to resume a row that was fused from a DIFFERENT
+#      panel than the --panel file given now -- the "forgot to change
+#      --experiment along with --panel" trap. Must fail BEFORE --out is
+#      opened for writing (leaves any prior good rows intact).
+_panel_v1 = os.path.join(_results_dir, "test_fuse_configid_v1.jsonl")
+_panel_v2 = os.path.join(_results_dir, "test_fuse_configid_v2.jsonl")
+panel_module.run(base_url, "0g/fusion-preview", ["m-a"], _panel_v1, limit=2, experiment="test-configid-v1")
+panel_module.run(base_url, "0g/fusion-preview", ["m-a", "m-b"], _panel_v2, limit=2, experiment="test-configid-v2")
+_configid_out = os.path.join(_results_dir, "test_fuse_configid_out.jsonl")
+fuse_module.run(base_url, "0g/fusion-preview", _panel_v1, _configid_out, experiment="test-configid-reused")
+try:
+    fuse_module.run(base_url, "0g/fusion-preview", _panel_v2, _configid_out, experiment="test-configid-reused")
+    check("eval.fuse refuses to resume a row fused from a DIFFERENT panel than --panel gives now", False)
+except ResumeMismatchError:
+    check("eval.fuse refuses to resume a row fused from a DIFFERENT panel than --panel gives now", True)
+check("the mismatch aborts before --out is opened for writing, leaving the old (v1) rows intact",
+      all("m-a+m-b" not in json.loads(l)["config_id"] for l in open(_configid_out, encoding="utf-8")))
+for _p in (_panel_v1, _panel_v2, _configid_out):
+    os.remove(_p)
+
+# 22d. eval.grade must refuse to blend two DIFFERENT fusion results for the
+#      same question_id into one score -- e.g. gluing two variant fuse files
+#      together (a glob like `gpqa-fuse-*.jsonl`) instead of grading one at
+#      a time.
+_two_fuse_a = os.path.join(_results_dir, "test_two_fuse_a.jsonl")
+_two_fuse_b = os.path.join(_results_dir, "test_two_fuse_b.jsonl")
+panel_module.run(base_url, "0g/fusion-preview", ["m-a"], _two_fuse_a, limit=1, experiment="test-two-fuse-a-panel")
+panel_module.run(base_url, "0g/fusion-preview", ["m-a", "m-b"], _two_fuse_b, limit=1, experiment="test-two-fuse-b-panel")
+_two_fuse_a_out = os.path.join(_results_dir, "test_two_fuse_a_out.jsonl")
+_two_fuse_b_out = os.path.join(_results_dir, "test_two_fuse_b_out.jsonl")
+fuse_module.run(base_url, "0g/fusion-preview", _two_fuse_a, _two_fuse_a_out, experiment="test-two-fuse-a")
+fuse_module.run(base_url, "0g/fusion-preview", _two_fuse_b, _two_fuse_b_out, experiment="test-two-fuse-b")
+try:
+    grade_replay(_two_fuse_a_out, _two_fuse_b_out)
+    check("eval.grade refuses to merge two different fusion results for the same question_id", False)
+except GradeMergeError:
+    check("eval.grade refuses to merge two different fusion results for the same question_id", True)
+for _p in (_two_fuse_a, _two_fuse_b, _two_fuse_a_out, _two_fuse_b_out):
+    os.remove(_p)
+
+# 22e. eval.panel must refuse a --fusion-model that would never reach the
+#      panel_only path (anything not starting with "0g/fusion") -- BEFORE
+#      any calls, instead of billing a real call per question that then
+#      fails with an opaque KeyError.
+_bad_model_out = os.path.join(_results_dir, "test_bad_fusion_model.jsonl")
+panel_module.call_api = _counting_call_api_p
+try:
+    _pcalls["n"] = 0
+    try:
+        panel_module.run(base_url, "gpt-5.6-sol", ["m-a"], _bad_model_out, limit=2, experiment="test-bad-model")
+        check("eval.panel refuses a --fusion-model that doesn't start with '0g/fusion'", False)
+    except ValueError as e:
+        check("eval.panel refuses a --fusion-model that doesn't start with '0g/fusion'", "0g/fusion" in str(e))
+    check("...and refuses it BEFORE making any calls", _pcalls["n"] == 0)
+finally:
+    panel_module.call_api = _orig_call_api_p
+check("...and --out was never created", not os.path.exists(_bad_model_out))
 
 server.shutdown()
 gpqa_tasks_module.REAL_DEFAULT_PATH = _orig_real_default

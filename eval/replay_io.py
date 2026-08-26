@@ -82,7 +82,7 @@ def load_existing(out_path, expected, expected_schema=None):
                 f"(correct_letter={expected[qid][1]!r}). Use a new --experiment name, or "
                 f"--no-resume to discard the old rows and recompute."
             )
-        if expected_schema and row.get("schema") and row["schema"] != expected_schema:
+        if expected_schema and row.get("schema") != expected_schema:
             raise ResumeMismatchError(
                 f"{out_path!r} already has a row for question_id={qid!r} written by a DIFFERENT tool "
                 f"(schema={row['schema']!r}, this tool writes {expected_schema!r}) -- probably the "

@@ -36,8 +36,15 @@ def _score(rows, get_content):
     call_failed), decided by presence, NOT by any row-level "failed" flag:
     that flag can be scoped to a single baseline model while fusion (or a
     different baseline) succeeded in the same row -- keying off it would
-    discard perfectly good answers and understate accuracy."""
-    correct = extraction_failed = call_failed = total = 0
+    discard perfectly good answers and understate accuracy.
+
+    `no_ground_truth` (a row with no `correct_letter` at all -- only
+    possible via a malformed/hand-edited replay file, never eval.panel's own
+    output) is counted separately too, rather than falling through to a
+    `letter == None` comparison that's always False: that would silently
+    count a good answer as WRONG instead of flagging that this row simply
+    can't be graded."""
+    correct = extraction_failed = call_failed = no_ground_truth = total = 0
     for row in rows:
         total += 1
         content = get_content(row)
@@ -48,6 +55,9 @@ def _score(rows, get_content):
         if letter is None:
             extraction_failed += 1
             continue
+        if row.get("correct_letter") is None:
+            no_ground_truth += 1
+            continue
         if letter == row["correct_letter"]:
             correct += 1
     return {
@@ -55,6 +65,7 @@ def _score(rows, get_content):
         "correct": correct,
         "extraction_failed": extraction_failed,
         "call_failed": call_failed,
+        "no_ground_truth": no_ground_truth,
         "n": total,
     }
 
@@ -109,6 +120,21 @@ def load_rows(paths):
                             f"These files were not built from the same question set; don't grade them "
                             f"together."
                         )
+                if (prior and prior.get("fusion") and row.get("fusion")
+                        and prior.get("config_id") and row.get("config_id")
+                        and prior["config_id"] != row["config_id"]):
+                    # Two DIFFERENT fusion results for the same question_id --
+                    # e.g. two variant fuse files glued together (`eval.grade
+                    # gpqa-fuse-*.jsonl`) instead of graded one at a time.
+                    # {**prior, **row} would let the later file's `fusion`
+                    # silently win with no error, blending variants into one
+                    # "fusion" score that's a per-question mixture of both.
+                    raise GradeMergeError(
+                        f"question_id={qid!r} has a DIFFERENT fusion result in {path!r} than in an "
+                        f"earlier file being merged -- config_id {prior['config_id']!r} vs "
+                        f"{row['config_id']!r}. These are two different fusion configs (e.g. different "
+                        f"panel variants); grade them separately, not merged into one score."
+                    )
                 merged[qid] = {**(prior or {}), **row}
     return list(merged.values())
 
