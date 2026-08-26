@@ -6,6 +6,7 @@ shape -- so all of that lives here once. Everything task-specific -- what a
 row contains, what gets called, what counts as a failure -- stays in each
 script, behind run_replay()'s `process` callback.
 """
+import argparse
 import json
 import os
 import re
@@ -24,11 +25,23 @@ def parse_models(raw):
     return models
 
 
+def _positive_int(raw):
+    n = int(raw)
+    if n <= 0:
+        # `if limit:` (every caller's actual limit check) treats 0 the same
+        # as "no limit at all" -- silently running the FULL question set
+        # instead of the empty/dry-run someone typing --limit 0 almost
+        # certainly meant. A negative --limit would slice from the end
+        # instead of narrowing anything. Reject both at the argparse layer.
+        raise argparse.ArgumentTypeError("--limit must be a positive integer (omit it for no limit)")
+    return n
+
+
 def add_out_args(p):
     """--out/--limit/--no-resume, identical in all three writers' argparse
     setup. --models/--experiment/--*-url stay in each script -- tool-specific."""
     p.add_argument("--out", default=None, help="Defaults to results/<experiment>.jsonl.")
-    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--limit", type=_positive_int, default=None)
     p.add_argument("--no-resume", action="store_true", help="Ignore any existing rows at --out.")
 
 
@@ -80,11 +93,18 @@ def load_existing(out_path, expected, expected_schema=None):
         return {}
     existing = {}
     with open(out_path, encoding="utf-8") as f:
-        for line in f:
+        for line_num, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
-            row = json.loads(line)
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as e:
+                # This fires before --out is ever opened for writing, so a
+                # corrupt/hand-edited file can be fixed and nothing is lost
+                # -- but only if the operator can tell WHICH file and WHERE;
+                # the bare JSONDecodeError says neither.
+                raise ValueError(f"{out_path!r} line {line_num}: {e}") from e
             existing[row["question_id"]] = row
     for qid, row in existing.items():
         # Rows this run won't reuse anyway can't corrupt it: a failed row gets
@@ -112,37 +132,24 @@ def load_existing(out_path, expected, expected_schema=None):
     return existing
 
 
-def carry_over_unprocessed(f, existing, expected):
-    """Copy prior rows for questions OUTSIDE this run's window into the
-    freshly rewritten --out, and return how many.
-
-    Every run truncates --out and rewrites it, so without this, re-running a
-    `--limit 5` smoke test against an --out that already holds a finished
-    198-question run would delete the other 193 -- rows that cost real API
-    spend. `expected` defines the window; whatever's outside it is preserved.
-    (--no-resume is the way to genuinely shrink a file: it starts from no
-    prior rows at all, so there is nothing here to carry.)
-
-    Called unconditionally by run_replay() below, regardless of --limit:
-    `expected` can shrink for reasons that have nothing to do with THIS run's
-    own --limit (the underlying dataset or --panel file shrinking instead).
-    Gating this on --limit alone missed that and silently deleted
-    already-paid rows -- calling it from the one shared place instead of
-    copy-pasted into each writer is what keeps that fixed.
-
-    Written in the prior file's own order, after the rows this run handled,
-    which for --limit's leading window keeps question_id order."""
-    carried = 0
-    for qid, row in existing.items():
-        if qid not in expected:
-            f.write(json.dumps(row) + "\n")
-            carried += 1
-    return carried
-
-
-def run_replay(items, get_qid, process, out_path, existing, expected):
+def run_replay(items, get_qid, process, out_path, existing):
     """The write-loop shared by all three writers: open --out, write one row
-    per item, carry forward whatever's outside `expected`, return counts.
+    per item, then carry forward every `existing` row this attempt never
+    actually wrote a fresh line for -- and return counts.
+
+    That covers two distinct cases with one rule: rows outside this run's
+    window entirely (a smaller `--limit` than a prior run, or the underlying
+    dataset/--panel file having shrunk for reasons that have nothing to do
+    with THIS run's own --limit), AND rows still inside the window but not
+    yet reached because the run was interrupted (a real Ctrl-C, or anything
+    else escaping `process` -- a per-item try/except inside a tool's own
+    `process` can't catch a raw KeyboardInterrupt). The carry-over runs in a
+    `finally`, so an interruption mid-loop still preserves every row that
+    hasn't been freshly rewritten yet -- otherwise the already-paid rows
+    this exists to protect are the exact ones lost, right when a run is
+    being interrupted. Without --limit and running to completion, "not
+    written this attempt" and "outside the window" are the same set, so
+    normal full runs are unaffected.
 
     `process(item, prior)` -- prior = existing.get(get_qid(item)) -- owns
     everything task-specific (skip/call/fail, build the row, log it) and
@@ -151,17 +158,28 @@ def run_replay(items, get_qid, process, out_path, existing, expected):
     more than one of its N models) added into the running totals, or `{}`
     for the ordinary case."""
     counts = {}
+    written = set()
     with open(out_path, "w", encoding="utf-8") as f:
         try:
             for item in items:
-                row, deltas = process(item, existing.get(get_qid(item)))
+                qid = get_qid(item)
+                row, deltas = process(item, existing.get(qid))
                 for key, delta in (deltas or {}).items():
+                    # A typo'd key here (e.g. "skiped") would otherwise
+                    # accumulate silently under the wrong name -- the
+                    # printed summary is what an operator reads to decide
+                    # whether a paid run did what they expected, so a silent
+                    # miscount there is exactly the wrong place to be quiet.
+                    # "carried" is computed below, not by `process`.
+                    assert key in ("skipped", "failed"), f"run_replay: unknown delta key {key!r}"
                     counts[key] = counts.get(key, 0) + delta
                 f.write(json.dumps(row) + "\n")
+                written.add(qid)
         finally:
-            # In a `finally`, not after the loop: a real Ctrl-C (or anything
-            # else escaping `process`) must not skip this. Otherwise the
-            # out-of-window rows this exists to protect are the exact ones
-            # lost, right when a run is being interrupted -- the worst time.
-            counts["carried"] = counts.get("carried", 0) + carry_over_unprocessed(f, existing, expected)
+            carried = 0
+            for qid, row in existing.items():
+                if qid not in written:
+                    f.write(json.dumps(row) + "\n")
+                    carried += 1
+            counts["carried"] = counts.get("carried", 0) + carried
     return counts

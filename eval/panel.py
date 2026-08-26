@@ -38,6 +38,15 @@ from .replay_io import add_out_args, default_out_path, ensure_out_dir, load_exis
 SCHEMA = "0g.fusion_eval.gpqa.panel.v1"
 
 
+class PanelOnlyIgnoredError(Exception):
+    """--fusion-url ran (and billed) judge+synthesis despite panel_only=True
+    -- it's an eval-only extension (see pipeline.py's run_fusion docstring),
+    so any endpoint that doesn't implement it yet will just ignore the
+    field and answer normally. Not a per-question failure: it will recur
+    for every remaining question, so the whole run aborts immediately
+    rather than repeating the exact overspend this tool exists to avoid."""
+
+
 def _panel_by_model(row):
     return {p["model"]: p for p in (row.get("panel") or []) if not p.get("failed")}
 
@@ -74,8 +83,10 @@ def run(fusion_url, fusion_model, models, out_path, limit=None, experiment=None,
     reuse = load_existing(reuse_path, expected, expected_schema=SCHEMA) if reuse_path else {}
 
     dropped = {}  # model -> number of questions where a prior answer for it is being discarded
+    reused = 0  # (question, model) pairs pulled from --reuse instead of called fresh
 
     def process(task, prior):
+        nonlocal reused
         qid = task["question_id"]
         # Read from a prior row even if it's marked failed -- a batch failure
         # (see the except branch below) can still have left some models
@@ -98,6 +109,7 @@ def run(fusion_url, fusion_model, models, out_path, limit=None, experiment=None,
                 cached.append(have_here[m])
             elif m in have_reuse:
                 cached.append(have_reuse[m])
+                reused += 1
             else:
                 fresh_models.append(m)
 
@@ -117,7 +129,22 @@ def run(fusion_url, fusion_model, models, out_path, limit=None, experiment=None,
             resp = call_api(fusion_url, fusion_model, messages, panel_only=True,
                              cached_panel=cached, extra_panel_models=fresh_models,
                              experiment=experiment, question_id=qid)
+            if "choices" in resp:
+                # A real completion came back -- panel_only was ignored and
+                # judge+synthesis already ran (and was billed) for this
+                # question. The panel data in this response can't be
+                # trusted either (it may be --fusion-url's own default
+                # panel, not --models), so there's nothing here worth
+                # keeping.
+                raise PanelOnlyIgnoredError(
+                    f"{fusion_url!r} did not honor panel_only for question_id={qid!r} -- got a full "
+                    f"completion back (judge+synthesis already ran and was billed) instead of "
+                    f"stopping after the panel. --fusion-url is probably pointed at a server that "
+                    f"doesn't support panel_only yet."
+                )
             return {**_base_row(qid, task), "panel": resp["0g_fusion"]["panel"]}, {}
+        except PanelOnlyIgnoredError:
+            raise
         except Exception as e:
             print(f"eval.panel_question_failed question_id={qid!r} error={str(e)!r}", file=sys.stderr)
             # `cached` (whatever was already sitting in --out/--reuse before
@@ -126,7 +153,7 @@ def run(fusion_url, fusion_model, models, out_path, limit=None, experiment=None,
             # models that already succeeded.
             return {**_base_row(qid, task), "panel": cached, "failed": True, "error": str(e)}, {"failed": 1}
 
-    counts = run_replay(tasks, lambda t: t["question_id"], process, out_path, existing, expected)
+    counts = run_replay(tasks, lambda t: t["question_id"], process, out_path, existing)
     skipped, carried, failed = counts.get("skipped", 0), counts.get("carried", 0), counts.get("failed", 0)
     if skipped:
         print(f"eval.panel_resumed skipped={skipped} (already had every requested model for these "
@@ -134,6 +161,14 @@ def run(fusion_url, fusion_model, models, out_path, limit=None, experiment=None,
     if carried:
         print(f"eval.panel_carried_over={carried} (rows outside this run's question set, left "
               f"untouched at {out_path!r})", file=sys.stderr)
+    if reuse_path:
+        # --reuse can only pull what's actually IN that file -- a stale or
+        # too-small --reuse path silently degrades into calling everything
+        # fresh, with no other visible sign anything was off. Print the hit
+        # count whenever --reuse was given at all, including reused=0.
+        print(f"eval.panel_reused={reused} (model answers pulled from {reuse_path!r} without a "
+              f"fresh call; 0 means --reuse had nothing usable -- check the path/experiment)",
+              file=sys.stderr)
     if dropped:
         print(f"eval.panel_dropped_models={dropped} (present in {out_path!r} before this run, not in "
               f"--models this time, so removed from these questions' panel -- expected if you meant to "

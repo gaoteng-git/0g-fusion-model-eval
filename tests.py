@@ -1596,12 +1596,16 @@ check("...and --out was never created", not os.path.exists(_bad_model_out))
 
 # 23a. an exception escaping `process` (a real Ctrl-C is exactly this: a
 #      BaseException the per-item try/except inside each tool can't catch)
-#      must NOT skip carrying forward out-of-window rows -- those are the
-#      ones already paid for, and losing them at the exact moment a run is
-#      being interrupted is the worst time to lose them.
+#      must NOT lose a single already-paid row -- neither the ones outside
+#      this run's `items` window at all, NOR the ones inside it that simply
+#      hadn't been reached yet when the interruption hit. The two used to be
+#      the same set (whatever carry_over_unprocessed() considered "outside
+#      expected"); tracking what was actually WRITTEN this attempt, instead
+#      of what was merely requested, covers both -- an interrupted FULL run
+#      (no --limit at all, the common/expensive case) is exactly the case
+#      the older "outside expected" rule protected zero rows in.
 _carry_repro_path = os.path.join(_results_dir, "test_carry_on_exception.jsonl")
 _repro_existing = {i: {"question_id": i, "val": f"old-{i}"} for i in range(6)}
-_repro_expected = {i: (f"q{i}", "A") for i in range(3)}  # this run's window is qids 0-2
 
 
 def _raise_on_item_1(item, prior):
@@ -1611,18 +1615,97 @@ def _raise_on_item_1(item, prior):
 
 
 try:
-    run_replay([0, 1, 2], lambda x: x, _raise_on_item_1, _carry_repro_path, _repro_existing, _repro_expected)
+    run_replay([0, 1, 2], lambda x: x, _raise_on_item_1, _carry_repro_path, _repro_existing)
     check("run_replay propagates an exception from `process` instead of swallowing it", False)
 except RuntimeError:
     check("run_replay propagates an exception from `process` instead of swallowing it", True)
-with open(_carry_repro_path, encoding="utf-8") as f:
-    _carry_repro_rows = [json.loads(l) for l in f]
-check("...but still carries forward every out-of-window row before re-raising, even though the "
-      "loop never finished",
-      sorted(r["question_id"] for r in _carry_repro_rows if r["question_id"] >= 3) == [3, 4, 5])
-check("...and still wrote whatever succeeded before the exception (question 0)",
-      any(r["question_id"] == 0 and r["val"] == "new-0" for r in _carry_repro_rows))
+_carry_repro_by_qid = {json.loads(l)["question_id"]: json.loads(l) for l in open(_carry_repro_path, encoding="utf-8")}
+check("...still wrote whatever succeeded before the exception (question 0, fresh)",
+      _carry_repro_by_qid[0]["val"] == "new-0")
+check("...restores the IN-WINDOW row that was never reached (question 2, never attempted this run)",
+      _carry_repro_by_qid[2]["val"] == "old-2")
+check("...restores the item that raised itself, too (question 1 -- no new row was ever produced for it)",
+      _carry_repro_by_qid[1]["val"] == "old-1")
+check("...and every row entirely OUTSIDE this run's items (3, 4, 5) survives as before",
+      all(_carry_repro_by_qid[i]["val"] == f"old-{i}" for i in (3, 4, 5)))
+check("nothing is lost or duplicated: all 6 original rows are present, exactly once",
+      sorted(_carry_repro_by_qid) == [0, 1, 2, 3, 4, 5])
 os.remove(_carry_repro_path)
+
+# --- 24. more regressions found in the 3rd independent review round -------
+
+# 24a. --limit must reject 0 and negative values at the CLI -- `if limit:`
+#      (every caller's real check) treats 0 exactly like "no limit at all",
+#      silently running the FULL question set instead of the empty/dry-run
+#      someone typing --limit 0 almost certainly meant.
+for _limit_args, _label in (
+    (["eval.panel", "--models", "m-a", "--limit", "0"], "eval.panel --limit 0"),
+    (["eval.panel", "--models", "m-a", "--limit", "-3"], "eval.panel --limit -3"),
+    (["eval.fuse", "--panel", "does-not-matter.jsonl", "--limit", "0"], "eval.fuse --limit 0"),
+    (["eval.baseline", "--models", "m-a", "--limit", "0"], "eval.baseline --limit 0"),
+):
+    _r = _cli(*_limit_args)
+    check(f"{_label} is rejected at the CLI (not silently treated as no-limit)", _r.returncode != 0)
+
+# 24b. eval.panel must abort the WHOLE run, immediately, if --fusion-url
+#      ignores panel_only and returns a real completion (judge+synthesis
+#      already ran and was billed) -- continuing would repeat that exact
+#      overspend for every remaining question, and the returned panel data
+#      can't be trusted either (may be the server's own default, not
+#      --models).
+_ignored_path = os.path.join(_results_dir, "test_panel_only_ignored.jsonl")
+
+
+def _panel_only_ignored(url, model, msgs, **kw):
+    if kw.get("question_id") == 1:
+        return {"choices": [{"message": {"content": "a real answer, judge+synthesis already ran"}}],
+                "0g_fusion": {"panel": []}}
+    return _orig_call_api_p(url, model, msgs, **kw)
+
+
+panel_module.call_api = _panel_only_ignored
+try:
+    panel_module.run(base_url, "0g/fusion-preview", ["m-a"], _ignored_path, limit=3, experiment="test-ignored")
+    check("eval.panel aborts the whole run when --fusion-url ignores panel_only", False)
+except panel_module.PanelOnlyIgnoredError as e:
+    check("eval.panel aborts the whole run when --fusion-url ignores panel_only",
+          "panel_only" in str(e) and "question_id=1" in str(e))
+finally:
+    panel_module.call_api = _orig_call_api_p
+with open(_ignored_path, encoding="utf-8") as f:
+    _ignored_rows = [json.loads(l) for l in f]
+check("...the question before the bad one still got written (nothing retroactively undone)",
+      len(_ignored_rows) == 1 and _ignored_rows[0]["question_id"] == 0)
+os.remove(_ignored_path)
+
+# 24c. eval.panel must report --reuse's hit rate -- a stale/too-small
+#      --reuse file degrades silently into calling everything fresh
+#      otherwise, with no other visible sign anything was off.
+_reuse_base_path = os.path.join(_results_dir, "test_reuse_visibility_base.jsonl")
+_reuse_variant_path = os.path.join(_results_dir, "test_reuse_visibility_variant.jsonl")
+panel_module.run(base_url, "0g/fusion-preview", ["m-a", "m-b"], _reuse_base_path, limit=3, experiment="test-reuse-vis-base")
+stderr_reuse_hit = io.StringIO()
+with contextlib.redirect_stderr(stderr_reuse_hit):
+    panel_module.run(base_url, "0g/fusion-preview", ["m-a", "m-b", "m-new"], _reuse_variant_path, limit=3,
+                      experiment="test-reuse-vis-variant", reuse_path=_reuse_base_path)
+check("eval.panel reports a nonzero reused= count when --reuse actually has usable data",
+      "eval.panel_reused=6" in stderr_reuse_hit.getvalue())  # 2 models x 3 questions
+
+# a --reuse file with none of the currently-requested models (e.g. pointed
+# at the wrong file, or a stale one from before a rename) has nothing
+# usable at all -- must show reused=0, not stay silent about --reuse having
+# had zero effect.
+_reuse_small_path = os.path.join(_results_dir, "test_reuse_visibility_small.jsonl")
+panel_module.run(base_url, "0g/fusion-preview", ["m-a"], _reuse_small_path, limit=1, experiment="test-reuse-vis-small")
+_reuse_variant2_path = os.path.join(_results_dir, "test_reuse_visibility_variant2.jsonl")
+stderr_reuse_miss = io.StringIO()
+with contextlib.redirect_stderr(stderr_reuse_miss):
+    panel_module.run(base_url, "0g/fusion-preview", ["m-new-2"], _reuse_variant2_path, limit=3,
+                      experiment="test-reuse-vis-variant2", reuse_path=_reuse_small_path)
+check("eval.panel reports reused=0 when --reuse had nothing usable, instead of staying silent",
+      "eval.panel_reused=0" in stderr_reuse_miss.getvalue())
+for _p in (_reuse_base_path, _reuse_variant_path, _reuse_small_path, _reuse_variant2_path):
+    os.remove(_p)
 
 server.shutdown()
 gpqa_tasks_module.REAL_DEFAULT_PATH = _orig_real_default

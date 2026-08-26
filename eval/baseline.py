@@ -66,7 +66,7 @@ def run(baseline_url, models, out_path, limit=None, experiment=None, resume=True
         row = {**_base_row(qid, task), "baselines": keep + new_entries}
         return row, ({"failed": num_failed} if num_failed else {})
 
-    counts = run_replay(tasks, lambda t: t["question_id"], process, out_path, existing, expected)
+    counts = run_replay(tasks, lambda t: t["question_id"], process, out_path, existing)
     skipped, carried, failed = counts.get("skipped", 0), counts.get("carried", 0), counts.get("failed", 0)
     if skipped:
         print(f"eval.baseline_resumed skipped={skipped} (already had every requested model for these "

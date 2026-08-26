@@ -105,7 +105,7 @@ def run(fusion_url, fusion_model, panel_path, out_path, limit=None, experiment=N
             row = {**_base_row(qid, panel_row), "panel": panel_row.get("panel"), "failed": True, "error": str(e)}
             return row, {"failed": 1}
 
-    counts = run_replay(panel_rows, lambda r: r.get("question_id"), process, out_path, existing, expected)
+    counts = run_replay(panel_rows, lambda r: r.get("question_id"), process, out_path, existing)
     skipped, carried, failed = counts.get("skipped", 0), counts.get("carried", 0), counts.get("failed", 0)
     if skipped:
         print(f"eval.fuse_resumed skipped={skipped} (already had a successful result at {out_path!r})",
